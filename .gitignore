@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Dataset
+data/brats2023/
+
+# Processed data
+data/processed/
+
+# Dataset split files
+data/splits/
+
+# Models - temporarily not committed
+models/
+tests/
+
+# Temporary test
+preprocessing/encoder_input_test.py
+
+# IDE
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

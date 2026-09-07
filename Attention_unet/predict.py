@@ -1,17 +1,21 @@
 """
-3D Attention U-Net Inference Pipeline
--------------------------------------
+3D Attention U-Net Inference
+============================
 
-Uses the SAME 3D patch size used during training:
+Uses the trained Attention U-Net model to generate a
+3D segmentation mask for a REAL BraTS patient.
 
-    Training patch = (16, 32, 32)
+Training patch size:
+    (16, 32, 32)
 
-Inference is performed using overlapping patches and
-the logits are averaged before taking argmax.
+Input modalities:
+    t1n, t1c, t2w, t2f
 
-IMPORTANT:
-    pad_volume() works on (C, D, H, W).
-    The batch dimension is added AFTER padding.
+Output classes:
+    0 = Background
+    1 = NCR/NET
+    2 = Edema
+    3 = Enhancing Tumor
 """
 
 import os
@@ -22,8 +26,9 @@ import torch
 import torch.nn.functional as F
 import nibabel as nib
 
-from dataset import (
-    BraTSDataset3D,
+from dataset import BraTSDataset3D
+
+from dataset.transforms import (
     ZScoreNormalize,
     ToTensor,
     ComposeTransforms,
@@ -31,9 +36,7 @@ from dataset import (
 
 from models import AttentionUNet3D
 
-from utils import (
-    load_checkpoint,
-)
+from utils import load_checkpoint
 
 
 # ============================================================
@@ -53,18 +56,15 @@ NUM_CLASSES = 4
 # ============================================================
 
 def load_patient(patient_dir):
-    """
-    Load patient using the SAME dataset preprocessing
-    used during training.
 
-    Returns:
+    print()
+    print("=" * 60)
+    print("LOADING PATIENT")
+    print("=" * 60)
 
-        image:
-            (4, D, H, W)
-
-        mask:
-            (D, H, W)
-    """
+    print()
+    print("Patient directory:")
+    print(patient_dir)
 
     transform = ComposeTransforms([
         ZScoreNormalize(),
@@ -91,18 +91,20 @@ def load_patient(patient_dir):
 # ============================================================
 
 def pad_volume(image, patch_size):
+
     """
-    Make sure the volume is at least as large as the patch.
+    Input:
+        (C, D, H, W)
 
-    IMPORTANT:
-        Input MUST be:
-
-            (C, D, H, W)
-
-        NOT:
-
-            (B, C, D, H, W)
+    Output:
+        padded image
     """
+
+    if image.ndim != 4:
+        raise RuntimeError(
+            "pad_volume expected (C,D,H,W), "
+            f"but got {tuple(image.shape)}"
+        )
 
     _, D, H, W = image.shape
 
@@ -131,31 +133,28 @@ def pad_volume(image, patch_size):
 # PATCH POSITIONS
 # ============================================================
 
-def get_positions(volume_size, patch_size, stride):
-    """
-    Generate patch starting positions.
-
-    The last patch is forced to reach the end
-    of the volume.
-    """
+def get_positions(
+    volume_size,
+    patch_size,
+    stride,
+):
 
     if volume_size <= patch_size:
         return [0]
 
     positions = []
 
-    pos = 0
+    position = 0
 
-    while pos + patch_size < volume_size:
+    while position + patch_size < volume_size:
 
-        positions.append(pos)
+        positions.append(position)
 
-        pos += stride
+        position += stride
 
     last_position = volume_size - patch_size
 
     if len(positions) == 0 or positions[-1] != last_position:
-
         positions.append(last_position)
 
     return positions
@@ -172,41 +171,23 @@ def sliding_window_prediction(
     patch_size=PATCH_SIZE,
     stride=STRIDE,
 ):
-    """
-    Perform overlapping 3D patch inference.
-
-    Input:
-
-        image:
-            (1, 4, D, H, W)
-
-    Output:
-
-        prediction:
-            (D, H, W)
-    """
-
-    # --------------------------------------------------------
-    # Check input shape
-    # --------------------------------------------------------
 
     if image.ndim != 5:
 
         raise RuntimeError(
-            "sliding_window_prediction expected "
-            f"(B,C,D,H,W), but got {tuple(image.shape)}"
+            "Expected image shape "
+            "(B,C,D,H,W), but got "
+            f"{tuple(image.shape)}"
         )
 
     B, C, D, H, W = image.shape
 
     if B != 1:
-
         raise RuntimeError(
             f"Expected batch size 1, got {B}"
         )
 
     if C != 4:
-
         raise RuntimeError(
             f"Expected 4 MRI modalities, got {C}"
         )
@@ -214,7 +195,7 @@ def sliding_window_prediction(
     pd, ph, pw = patch_size
 
     # --------------------------------------------------------
-    # Get positions
+    # PATCH POSITIONS
     # --------------------------------------------------------
 
     d_positions = get_positions(
@@ -235,29 +216,32 @@ def sliding_window_prediction(
         stride[2],
     )
 
-    print()
-    print("=" * 60)
-    print("SLIDING-WINDOW INFERENCE")
-    print("=" * 60)
-
-    print("Volume :", (D, H, W))
-    print("Patch  :", patch_size)
-    print("Stride :", stride)
-
-    print("D positions:", d_positions)
-    print("H positions:", h_positions)
-    print("W positions:", w_positions)
-
     total_patches = (
         len(d_positions)
         * len(h_positions)
         * len(w_positions)
     )
 
+    print()
+    print("=" * 60)
+    print("SLIDING-WINDOW INFERENCE")
+    print("=" * 60)
+
+    print()
+    print("Volume :", (D, H, W))
+    print("Patch  :", patch_size)
+    print("Stride :", stride)
+
+    print()
+    print("D positions:", d_positions)
+    print("H positions:", h_positions)
+    print("W positions:", w_positions)
+
+    print()
     print("Total patches:", total_patches)
 
     # --------------------------------------------------------
-    # Allocate accumulators
+    # ACCUMULATORS
     # --------------------------------------------------------
 
     logits_sum = torch.zeros(
@@ -285,7 +269,7 @@ def sliding_window_prediction(
     )
 
     # --------------------------------------------------------
-    # Inference
+    # INFERENCE
     # --------------------------------------------------------
 
     model.eval()
@@ -302,10 +286,6 @@ def sliding_window_prediction(
 
                     patch_number += 1
 
-                    # ------------------------------------------------
-                    # Extract patch
-                    # ------------------------------------------------
-
                     patch = image[
                         :,
                         :,
@@ -316,15 +296,7 @@ def sliding_window_prediction(
 
                     patch = patch.to(device)
 
-                    # ------------------------------------------------
-                    # Model
-                    # ------------------------------------------------
-
                     logits = model(patch)
-
-                    # ------------------------------------------------
-                    # Validate output
-                    # ------------------------------------------------
 
                     if logits.ndim != 5:
 
@@ -337,13 +309,13 @@ def sliding_window_prediction(
                     if logits.shape[1] != NUM_CLASSES:
 
                         raise RuntimeError(
-                            f"Expected {NUM_CLASSES} output classes, "
+                            f"Expected {NUM_CLASSES} classes, "
                             f"but model returned "
                             f"{logits.shape[1]}"
                         )
 
                     # ------------------------------------------------
-                    # Accumulate logits
+                    # ADD LOGITS
                     # ------------------------------------------------
 
                     logits_sum[
@@ -355,7 +327,7 @@ def sliding_window_prediction(
                     ] += logits.float()
 
                     # ------------------------------------------------
-                    # Count how many predictions cover each voxel
+                    # COUNT OVERLAPPING PATCHES
                     # ------------------------------------------------
 
                     count_map[
@@ -375,7 +347,7 @@ def sliding_window_prediction(
     print()
 
     # --------------------------------------------------------
-    # Average overlapping logits
+    # AVERAGE LOGITS
     # --------------------------------------------------------
 
     logits_average = (
@@ -384,7 +356,7 @@ def sliding_window_prediction(
     )
 
     # --------------------------------------------------------
-    # Argmax
+    # ARGMAX
     # --------------------------------------------------------
 
     prediction = torch.argmax(
@@ -413,12 +385,6 @@ def save_prediction_nifti(
     patient_id,
     output_dir,
 ):
-    """
-    Save prediction as NIfTI.
-
-    Uses the original T1 MRI affine/header
-    so the prediction remains spatially aligned.
-    """
 
     os.makedirs(
         output_dir,
@@ -426,7 +392,7 @@ def save_prediction_nifti(
     )
 
     # --------------------------------------------------------
-    # Find T1 native MRI
+    # FIND T1N
     # --------------------------------------------------------
 
     t1_path = os.path.join(
@@ -434,17 +400,18 @@ def save_prediction_nifti(
         f"{patient_id}-t1n.nii.gz",
     )
 
-    # --------------------------------------------------------
-    # Fallback search
-    # --------------------------------------------------------
+    if not os.path.isfile(t1_path):
 
-    if not os.path.exists(t1_path):
+        t1_path = None
 
         for name in os.listdir(patient_dir):
 
             if (
                 "t1n" in name.lower()
                 and name.endswith(".nii.gz")
+                and os.path.isfile(
+                    os.path.join(patient_dir, name)
+                )
             ):
 
                 t1_path = os.path.join(
@@ -454,68 +421,41 @@ def save_prediction_nifti(
 
                 break
 
-    # --------------------------------------------------------
-    # Check
-    # --------------------------------------------------------
-
-    if not os.path.exists(t1_path):
+    if t1_path is None:
 
         raise FileNotFoundError(
-            "Could not find T1 native MRI for affine."
+            "Could not find T1 native MRI."
         )
 
     print()
     print("=" * 60)
-    print("SAVING PREDICTION")
+    print("SAVING 3D SEGMENTATION")
     print("=" * 60)
 
     print()
     print("Reference MRI:")
     print(t1_path)
 
-    # --------------------------------------------------------
-    # Load reference MRI
-    # --------------------------------------------------------
-
-    reference_nii = nib.load(
-        t1_path
-    )
-
-    # --------------------------------------------------------
-    # Check shape
-    # --------------------------------------------------------
+    reference_nii = nib.load(t1_path)
 
     if reference_nii.shape != prediction.shape:
 
         raise RuntimeError(
-            "Prediction shape does not match "
-            "reference MRI shape.\n"
-            f"Reference: {reference_nii.shape}\n"
+            "Prediction shape does not match MRI shape.\n"
+            f"MRI: {reference_nii.shape}\n"
             f"Prediction: {prediction.shape}"
         )
-
-    # --------------------------------------------------------
-    # Output path
-    # --------------------------------------------------------
 
     output_path = os.path.join(
         output_dir,
         f"{patient_id}_pred_seg.nii.gz",
     )
 
-    # --------------------------------------------------------
-    # Create NIfTI
-    # --------------------------------------------------------
-
     prediction_nii = nib.Nifti1Image(
         prediction.astype(np.uint8),
         reference_nii.affine,
         reference_nii.header.copy(),
     )
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
 
     nib.save(
         prediction_nii,
@@ -533,27 +473,18 @@ def print_statistics(
     prediction,
     ground_truth=None,
 ):
-    """
-    Print prediction and ground-truth statistics.
-    """
 
     print()
     print("=" * 60)
     print("PREDICTION STATISTICS")
     print("=" * 60)
 
-    # --------------------------------------------------------
-    # Shape
-    # --------------------------------------------------------
-
     print()
-    print(
-        "Prediction shape:",
-        prediction.shape,
-    )
+    print("Prediction shape:")
+    print(prediction.shape)
 
     # --------------------------------------------------------
-    # Prediction classes
+    # PREDICTION CLASSES
     # --------------------------------------------------------
 
     unique, counts = np.unique(
@@ -575,7 +506,7 @@ def print_statistics(
         )
 
     # --------------------------------------------------------
-    # Tumor voxels
+    # TUMOR VOXELS
     # --------------------------------------------------------
 
     tumor_voxels = int(
@@ -589,21 +520,25 @@ def print_statistics(
     )
 
     # --------------------------------------------------------
-    # Ground truth
+    # GROUND TRUTH
     # --------------------------------------------------------
 
     if ground_truth is not None:
 
-        gt = np.asarray(
-            ground_truth,
-            dtype=np.int64,
-        )
+        if torch.is_tensor(ground_truth):
+
+            gt = ground_truth.cpu().numpy()
+
+        else:
+
+            gt = np.asarray(
+                ground_truth
+            )
 
         gt = np.squeeze(gt)
 
         print()
         print("Ground Truth shape:")
-
         print(gt.shape)
 
         gt_unique, gt_counts = np.unique(
@@ -624,10 +559,6 @@ def print_statistics(
                 f"{int(count)} voxels"
             )
 
-        # ----------------------------------------------------
-        # Ground truth tumor
-        # ----------------------------------------------------
-
         gt_tumor_voxels = int(
             np.sum(gt > 0)
         )
@@ -637,10 +568,6 @@ def print_statistics(
             "Ground Truth tumor voxels:",
             gt_tumor_voxels,
         )
-
-        # ----------------------------------------------------
-        # Agreement
-        # ----------------------------------------------------
 
         if gt.shape == prediction.shape:
 
@@ -676,17 +603,18 @@ def main():
         "--checkpoint",
         type=str,
         default="./checkpoints/best_model.pth",
-        help="Path to trained checkpoint",
+        help="Trained model checkpoint",
     )
 
     parser.add_argument(
         "--patient-dir",
         type=str,
         default=(
-            "./data/BraTS2023_Synthetic/"
-            "BraTS2023_Synthetic_000"
+            "C:/Datasets/BraTS2023/"
+            "ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData/"
+            "BraTS-GLI-00008-001"
         ),
-        help="Patient directory",
+        help="REAL BraTS patient directory",
     )
 
     parser.add_argument(
@@ -714,15 +642,22 @@ def main():
     print("=" * 60)
 
     print()
-    print("Device:", device)
-    print("Patient:", args.patient_dir)
-    print("Checkpoint:", args.checkpoint)
+    print("Device:")
+    print(device)
+
+    print()
+    print("Patient:")
+    print(args.patient_dir)
+
+    print()
+    print("Checkpoint:")
+    print(args.checkpoint)
 
     # ========================================================
     # CHECK PATIENT
     # ========================================================
 
-    if not os.path.exists(
+    if not os.path.isdir(
         args.patient_dir
     ):
 
@@ -735,7 +670,7 @@ def main():
     # CHECK CHECKPOINT
     # ========================================================
 
-    if not os.path.exists(
+    if not os.path.isfile(
         args.checkpoint
     ):
 
@@ -761,6 +696,8 @@ def main():
             128,
             256,
         ],
+        dropout=0.1,
+        use_transpose=True,
     ).to(device)
 
     # ========================================================
@@ -768,7 +705,7 @@ def main():
     # ========================================================
 
     print()
-    print("Loading checkpoint...")
+    print("Loading trained model...")
 
     load_checkpoint(
         args.checkpoint,
@@ -776,30 +713,19 @@ def main():
         device=device,
     )
 
-    print(
-        "Checkpoint loaded successfully."
-    )
+    print()
+    print("Checkpoint loaded successfully.")
 
     # ========================================================
     # LOAD PATIENT
     # ========================================================
 
-    print()
-    print("Loading patient MRI...")
-
     image, ground_truth = load_patient(
         args.patient_dir
     )
 
-    # --------------------------------------------------------
-    # Check image
-    # --------------------------------------------------------
-
     print()
-    print(
-        "Original image tensor shape:"
-    )
-
+    print("Original image shape:")
     print(image.shape)
 
     if image.ndim != 4:
@@ -811,62 +737,43 @@ def main():
         )
 
     # ========================================================
-    # IMPORTANT:
-    #
-    # PAD BEFORE ADDING BATCH DIMENSION
-    #
-    # image = (4,D,H,W)
-    #
-    # pad_volume() expects exactly this.
+    # PAD
     # ========================================================
+
+    original_shape = image.shape[1:]
 
     print()
     print("Padding volume if necessary...")
-
-    original_shape = image.shape[1:]
 
     image_padded, padding = pad_volume(
         image,
         PATCH_SIZE,
     )
 
-    print(
-        "Original spatial shape:",
-        original_shape,
-    )
-
-    print(
-        "Padded spatial shape:",
-        image_padded.shape[1:],
-    )
-
-    print(
-        "Padding:",
-        padding,
-    )
-
-    # ========================================================
-    # NOW ADD BATCH DIMENSION
-    #
-    # (4,D,H,W)
-    #
-    #       ↓
-    #
-    # (1,4,D,H,W)
-    # ========================================================
-
-    image_padded = image_padded.unsqueeze(
-        0
-    )
+    print()
+    print("Original spatial shape:")
+    print(original_shape)
 
     print()
-    print(
-        "Model input volume:",
-        tuple(image_padded.shape),
-    )
+    print("Padded spatial shape:")
+    print(image_padded.shape[1:])
+
+    print()
+    print("Padding:")
+    print(padding)
 
     # ========================================================
-    # SLIDING WINDOW
+    # ADD BATCH DIMENSION
+    # ========================================================
+
+    image_padded = image_padded.unsqueeze(0)
+
+    print()
+    print("Model input:")
+    print(tuple(image_padded.shape))
+
+    # ========================================================
+    # PREDICTION
     # ========================================================
 
     prediction = sliding_window_prediction(
@@ -890,10 +797,8 @@ def main():
     ]
 
     print()
-    print(
-        "Prediction after removing padding:",
-        prediction.shape,
-    )
+    print("Prediction shape after removing padding:")
+    print(prediction.shape)
 
     # ========================================================
     # GROUND TRUTH
@@ -903,9 +808,7 @@ def main():
 
     if ground_truth is not None:
 
-        if torch.is_tensor(
-            ground_truth
-        ):
+        if torch.is_tensor(ground_truth):
 
             gt_np = ground_truth.cpu().numpy()
 
@@ -915,9 +818,7 @@ def main():
                 ground_truth
             )
 
-        gt_np = np.squeeze(
-            gt_np
-        )
+        gt_np = np.squeeze(gt_np)
 
     # ========================================================
     # STATISTICS
@@ -959,21 +860,20 @@ def main():
     print("=" * 60)
 
     print()
-    print("Prediction saved to:")
+    print("Patient:")
+    print(patient_id)
 
+    print()
+    print("Prediction saved to:")
     print(output_path)
 
     print()
     print("Final prediction shape:")
-
     print(prediction.shape)
 
     print()
-    print("Final prediction classes:")
-
-    print(
-        np.unique(prediction)
-    )
+    print("Prediction classes:")
+    print(np.unique(prediction))
 
     print()
     print(

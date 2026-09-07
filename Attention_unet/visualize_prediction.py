@@ -1,21 +1,36 @@
 """
-BraTS 2023 - Attention U-Net 3D Prediction + 3D NIfTI Output
---------------------------------------------------------------
+BraTS 2023 - 3D Attention U-Net Prediction
+-------------------------------------------
 
-This script:
+Input:
+    T1n
+    T1c
+    T2w
+    T2f
 
-1. Loads T1n, T1c, T2w and T2f
-2. Loads the trained 3D Attention U-Net
-3. Performs FULL 3D volume prediction
-4. Saves the predicted segmentation as:
+Model:
+    3D Attention U-Net
 
-       results/segmentation_3d.nii.gz
+Classes produced by the trained model:
+    0 = Background
+    1 = NCR / NET
+    2 = Edema
+    3 = Enhancing Tumor
 
-5. Also creates the familiar visualization:
+Segmentation visualization:
+    Black  = Background
+    Yellow = Tumor Core / NCR-NET
+    Purple = Edema
+    Red    = Enhancing Tumor
 
-       T1n | T1c | T2w | T2f | Segmentation
+Derived BraTS regions:
+    WT = NCR/NET + Edema + Enhancing Tumor
+    TC = NCR/NET + Enhancing Tumor
+    ET = Enhancing Tumor
 
-The NIfTI file is the important output for further 3D processing.
+Outputs:
+    results/segmentation_3d.nii.gz
+    results/prediction.png
 """
 
 import os
@@ -25,6 +40,7 @@ import argparse
 import numpy as np
 import nibabel as nib
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 
 import torch
 import torch.nn.functional as F
@@ -38,8 +54,6 @@ from models import AttentionUNet3D
 
 PATCH_SIZE = (16, 32, 32)
 
-# Stride controls overlap between patches.
-# Smaller stride = more overlap = slower but smoother prediction.
 STRIDE = (8, 16, 16)
 
 NUM_CLASSES = 4
@@ -62,7 +76,7 @@ DEVICE = torch.device(
 
 
 # ============================================================
-# FIND BRATS FILE
+# FIND MODALITY FILE
 # ============================================================
 
 def get_modality_file(patient_dir, modality):
@@ -70,8 +84,9 @@ def get_modality_file(patient_dir, modality):
     patient_dir = os.path.abspath(patient_dir)
 
     if not os.path.isdir(patient_dir):
+
         raise FileNotFoundError(
-            f"\nPatient directory does not exist:\n"
+            "\nPatient directory does not exist:\n"
             f"{patient_dir}\n"
         )
 
@@ -97,6 +112,7 @@ def get_modality_file(patient_dir, modality):
         matches = glob.glob(pattern)
 
         if len(matches) > 0:
+
             return matches[0]
 
     # Recursive search
@@ -112,11 +128,14 @@ def get_modality_file(patient_dir, modality):
     )
 
     if len(matches) > 0:
+
         return matches[0]
 
     raise FileNotFoundError(
-        f"\nCould not find *{modality}.nii.gz "
-        f"inside:\n{patient_dir}\n"
+        "\nCould not find "
+        f"*{modality}.nii.gz "
+        "inside:\n"
+        f"{patient_dir}\n"
     )
 
 
@@ -152,11 +171,13 @@ def zscore_normalize(volume):
     mask = volume != 0
 
     if not np.any(mask):
+
         return volume
 
     values = volume[mask]
 
     mean = values.mean()
+
     std = values.std()
 
     if std < 1e-8:
@@ -185,7 +206,7 @@ def load_patient(patient_dir):
 
     print(
         "Patient directory:",
-        patient_dir
+        os.path.abspath(patient_dir)
     )
 
     images = {}
@@ -215,7 +236,7 @@ def load_patient(patient_dir):
     if len(set(shapes)) != 1:
 
         raise RuntimeError(
-            "MRI modalities do not have "
+            "\nMRI modalities do not have "
             "the same shape.\n"
             f"Shapes found: {shapes}"
         )
@@ -230,72 +251,28 @@ def load_patient(patient_dir):
 
 
 # ============================================================
-# GET REFERENCE NIFTI
+# REFERENCE NIFTI
 # ============================================================
 
 def get_reference_nifti(patient_dir):
-
-    """
-    Use T1n as the reference image.
-
-    Its affine/header are used when saving
-    the predicted 3D segmentation.
-    """
 
     t1n_path = get_modality_file(
         patient_dir,
         "t1n"
     )
 
-    reference = nib.load(
-        t1n_path
-    )
-
-    return reference
+    return nib.load(t1n_path)
 
 
 # ============================================================
-# LOAD GROUND TRUTH IF AVAILABLE
-# ============================================================
-
-def load_ground_truth(patient_dir):
-
-    try:
-
-        seg_path = get_modality_file(
-            patient_dir,
-            "seg"
-        )
-
-        print(
-            "Ground-truth segmentation:",
-            seg_path
-        )
-
-        seg = load_nifti(seg_path)
-
-        return seg.astype(
-            np.int64
-        )
-
-    except FileNotFoundError:
-
-        print(
-            "Ground-truth segmentation not found."
-        )
-
-        return None
-
-
-# ============================================================
-# MODEL
+# CREATE MODEL
 # ============================================================
 
 def create_model():
 
     print()
     print("=" * 70)
-    print("CREATING MODEL")
+    print("CREATING 3D ATTENTION U-NET")
     print("=" * 70)
 
     model = AttentionUNet3D(
@@ -312,9 +289,7 @@ def create_model():
         use_transpose=True,
     )
 
-    model = model.to(
-        DEVICE
-    )
+    model = model.to(DEVICE)
 
     return model
 
@@ -330,15 +305,19 @@ def load_checkpoint(
 
     print()
     print("=" * 70)
-    print("LOADING MODEL")
+    print("LOADING CHECKPOINT")
     print("=" * 70)
+
+    checkpoint_path = os.path.abspath(
+        checkpoint_path
+    )
 
     if not os.path.exists(
         checkpoint_path
     ):
 
         raise FileNotFoundError(
-            f"\nCheckpoint not found:\n"
+            "\nCheckpoint not found:\n"
             f"{checkpoint_path}\n"
         )
 
@@ -353,10 +332,7 @@ def load_checkpoint(
         weights_only=False
     )
 
-    if isinstance(
-        checkpoint,
-        dict
-    ):
+    if isinstance(checkpoint, dict):
 
         if "model_state_dict" in checkpoint:
 
@@ -384,28 +360,20 @@ def load_checkpoint(
 
         state_dict = checkpoint
 
-    # Remove DataParallel "module." prefix
+    # Remove "module." if trained using DataParallel
     cleaned_state_dict = {}
 
     for key, value in state_dict.items():
 
-        if key.startswith(
-            "module."
-        ):
+        if key.startswith("module."):
 
-            key = key[
-                len("module.") :
-            ]
+            key = key[len("module."):]
 
-        cleaned_state_dict[
-            key
-        ] = value
+        cleaned_state_dict[key] = value
 
-    missing, unexpected = (
-        model.load_state_dict(
-            cleaned_state_dict,
-            strict=False
-        )
+    missing, unexpected = model.load_state_dict(
+        cleaned_state_dict,
+        strict=False
     )
 
     if len(missing) > 0:
@@ -415,26 +383,12 @@ def load_checkpoint(
             len(missing)
         )
 
-        for key in missing[:10]:
-
-            print(
-                "   ",
-                key
-            )
-
     if len(unexpected) > 0:
 
         print(
             "\nWARNING: Unexpected keys:",
             len(unexpected)
         )
-
-        for key in unexpected[:10]:
-
-            print(
-                "   ",
-                key
-            )
 
     model.eval()
 
@@ -452,15 +406,13 @@ def load_checkpoint(
 
 def prepare_input(images):
 
-    volume_list = [
-        images["T1n"],
-        images["T1c"],
-        images["T2w"],
-        images["T2f"],
-    ]
-
     volume = np.stack(
-        volume_list,
+        [
+            images["T1n"],
+            images["T1c"],
+            images["T2w"],
+            images["T2f"],
+        ],
         axis=0
     )
 
@@ -468,15 +420,13 @@ def prepare_input(images):
         volume
     ).float()
 
-    tensor = tensor.unsqueeze(
-        0
-    )
+    tensor = tensor.unsqueeze(0)
 
     return tensor
 
 
 # ============================================================
-# CALCULATE PATCH START POSITIONS
+# GET PATCH POSITIONS
 # ============================================================
 
 def get_positions(
@@ -495,23 +445,16 @@ def get_positions(
 
     while position + patch_size < size:
 
-        positions.append(
-            position
-        )
+        positions.append(position)
 
         position += stride
 
-    last_position = (
-        size - patch_size
-    )
+    last_position = size - patch_size
 
-    if len(positions) == 0:
-
-        positions.append(
-            0
-        )
-
-    elif positions[-1] != last_position:
+    if (
+        len(positions) == 0
+        or positions[-1] != last_position
+    ):
 
         positions.append(
             last_position
@@ -529,36 +472,19 @@ def predict_volume(
     volume
 ):
 
-    """
-    Perform FULL 3D sliding-window prediction.
-
-    Input:
-
-        (1, 4, D, H, W)
-
-    Output:
-
-        (D, H, W)
-
-    Every voxel in the complete 3D brain volume
-    receives a segmentation class.
-    """
-
     print()
     print("=" * 70)
     print("FULL 3D PREDICTION")
     print("=" * 70)
 
-    _, channels, depth, height, width = (
-        volume.shape
-    )
+    _, _, depth, height, width = volume.shape
 
     pd, ph, pw = PATCH_SIZE
 
     sd, sh, sw = STRIDE
 
     print(
-        "Input volume:",
+        "Original volume:",
         (depth, height, width)
     )
 
@@ -568,7 +494,7 @@ def predict_volume(
     )
 
     print(
-        "Patch stride:",
+        "Stride:",
         STRIDE
     )
 
@@ -611,9 +537,7 @@ def predict_volume(
             value=0
         )
 
-    _, _, D, H, W = (
-        volume.shape
-    )
+    _, _, D, H, W = volume.shape
 
     # --------------------------------------------------------
     # Patch positions
@@ -639,30 +563,13 @@ def predict_volume(
 
     total_patches = (
         len(d_positions)
-        *
-        len(h_positions)
-        *
-        len(w_positions)
+        * len(h_positions)
+        * len(w_positions)
     )
 
     print()
     print(
-        "Depth positions:",
-        len(d_positions)
-    )
-
-    print(
-        "Height positions:",
-        len(h_positions)
-    )
-
-    print(
-        "Width positions:",
-        len(w_positions)
-    )
-
-    print(
-        "Total 3D patches:",
+        "Total patches:",
         total_patches
     )
 
@@ -700,6 +607,8 @@ def predict_volume(
 
     current = 0
 
+    model.eval()
+
     with torch.inference_mode():
 
         for d in d_positions:
@@ -711,7 +620,7 @@ def predict_volume(
                     current += 1
 
                     print(
-                        f"\r3D Prediction: "
+                        f"\rPredicting patch "
                         f"{current}/{total_patches}",
                         end="",
                         flush=True
@@ -764,7 +673,7 @@ def predict_volume(
     )
 
     # --------------------------------------------------------
-    # Convert logits to class labels
+    # Convert to class labels
     # --------------------------------------------------------
 
     prediction = torch.argmax(
@@ -790,21 +699,11 @@ def predict_volume(
         np.uint8
     )
 
-    print()
-    print(
-        "3D prediction shape:",
-        prediction.shape
-    )
-
-    print(
-        "3D prediction completed."
-    )
-
     return prediction
 
 
 # ============================================================
-# SAVE 3D NIFTI
+# SAVE NIFTI
 # ============================================================
 
 def save_segmentation_nifti(
@@ -812,14 +711,6 @@ def save_segmentation_nifti(
     reference_nifti,
     output_path
 ):
-
-    """
-    Save complete 3D prediction as NIfTI.
-
-    The affine and header from the original T1n
-    are preserved so the segmentation stays in
-    the same physical coordinate system.
-    """
 
     print()
     print("=" * 70)
@@ -837,109 +728,29 @@ def save_segmentation_nifti(
             exist_ok=True
         )
 
-    # --------------------------------------------------------
-    # Create NIfTI image
-    # --------------------------------------------------------
-
     segmentation_nii = nib.Nifti1Image(
         prediction,
         reference_nifti.affine,
         reference_nifti.header
     )
 
-    # Make datatype explicitly uint8
     segmentation_nii.set_data_dtype(
         np.uint8
     )
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
 
     nib.save(
         segmentation_nii,
         output_path
     )
 
-    print()
     print(
-        "3D segmentation saved:"
-    )
-
-    print(
+        "Saved:",
         output_path
     )
 
-    print()
-    print(
-        "Segmentation shape:",
-        prediction.shape
-    )
-
-    print(
-        "Voxel spacing:",
-        reference_nifti.header.get_zooms()[:3]
-    )
-
 
 # ============================================================
-# CHOOSE BEST SLICE
-# ============================================================
-
-def choose_slice(
-    images,
-    requested_slice=None
-):
-
-    volume = images["T1n"]
-
-    depth = volume.shape[2]
-
-    if requested_slice is not None:
-
-        index = int(
-            requested_slice
-        )
-
-        index = max(
-            0,
-            min(
-                index,
-                depth - 1
-            )
-        )
-
-        return index
-
-    nonzero_counts = []
-
-    for z in range(depth):
-
-        slice_data = volume[
-            :,
-            :,
-            z
-        ]
-
-        count = np.count_nonzero(
-            slice_data
-        )
-
-        nonzero_counts.append(
-            count
-        )
-
-    index = int(
-        np.argmax(
-            nonzero_counts
-        )
-    )
-
-    return index
-
-
-# ============================================================
-# DISPLAY NORMALIZATION
+# NORMALIZE MRI FOR DISPLAY
 # ============================================================
 
 def normalize_for_display(image):
@@ -955,9 +766,7 @@ def normalize_for_display(image):
 
     if nonzero.size == 0:
 
-        return np.zeros_like(
-            image
-        )
+        return np.zeros_like(image)
 
     low = np.percentile(
         nonzero,
@@ -971,9 +780,7 @@ def normalize_for_display(image):
 
     if high <= low:
 
-        return np.zeros_like(
-            image
-        )
+        return np.zeros_like(image)
 
     image = np.clip(
         image,
@@ -991,43 +798,43 @@ def normalize_for_display(image):
 
 
 # ============================================================
-# CREATE SEGMENTATION DISPLAY
+# CREATE COLORED SEGMENTATION MASK
 # ============================================================
 
-def create_segmentation_display(
+def create_colored_segmentation(
     prediction
 ):
 
-    prediction = prediction.astype(
-        np.int32
+    """
+    EXACT COLORS:
+
+    0 = Black      = Background
+    1 = Yellow     = NCR/NET / Tumor Core
+    2 = Purple     = Edema
+    3 = Red        = Enhancing Tumor
+    """
+
+    # --------------------------------------------------------
+    # Create custom colormap
+    # --------------------------------------------------------
+
+    cmap = ListedColormap(
+        [
+            "black",      # 0 Background
+            "yellow",     # 1 NCR / NET
+            "purple",     # 2 Edema
+            "red",        # 3 Enhancing Tumor
+        ]
     )
 
-    display = np.zeros(
-        prediction.shape,
-        dtype=np.float32
-    )
-
-    display[
-        prediction == 1
-    ] = 1
-
-    display[
-        prediction == 2
-    ] = 2
-
-    display[
-        prediction == 3
-    ] = 3
-
-    return display
+    return prediction, cmap
 
 
 # ============================================================
-# SAVE VISUALIZATION
+# SAVE SEGMENTATION MASK ONLY
 # ============================================================
 
-def save_visualization(
-    images,
+def save_segmentation_mask(
     prediction,
     slice_index,
     output_path
@@ -1035,175 +842,90 @@ def save_visualization(
 
     print()
     print("=" * 70)
-    print("CREATING VISUALIZATION")
+    print("CREATING SEGMENTATION MASK")
     print("=" * 70)
 
     # --------------------------------------------------------
-    # Extract one slice ONLY for display
+    # Take one axial slice
     # --------------------------------------------------------
 
-    t1n = images["T1n"][
+    mask = prediction[
         :,
         :,
         slice_index
     ]
 
-    t1c = images["T1c"][
-        :,
-        :,
-        slice_index
-    ]
-
-    t2w = images["T2w"][
-        :,
-        :,
-        slice_index
-    ]
-
-    t2f = images["T2f"][
-        :,
-        :,
-        slice_index
-    ]
-
-    # Prediction is now 3D.
-    # Only take one slice for the PNG.
-    pred_slice = prediction[
-        slice_index
-    ]
-
-    # --------------------------------------------------------
-    # Normalize MRI
-    # --------------------------------------------------------
-
-    t1n = normalize_for_display(
-        t1n
-    )
-
-    t1c = normalize_for_display(
-        t1c
-    )
-
-    t2w = normalize_for_display(
-        t2w
-    )
-
-    t2f = normalize_for_display(
-        t2f
-    )
-
-    seg_display = create_segmentation_display(
-        pred_slice
+    mask, cmap = create_colored_segmentation(
+        mask
     )
 
     # --------------------------------------------------------
-    # Figure
+    # Create figure
     # --------------------------------------------------------
 
-    fig, axes = plt.subplots(
-        1,
-        5,
-        figsize=(20, 5)
+    fig, ax = plt.subplots(
+        figsize=(7, 7)
     )
 
-    # --------------------------------------------------------
-    # T1n
-    # --------------------------------------------------------
-
-    axes[0].imshow(
-        t1n.T,
-        cmap="gray",
-        origin="lower"
-    )
-
-    axes[0].set_title(
-        "T1n",
-        fontsize=14
-    )
-
-    axes[0].axis("off")
-
-    # --------------------------------------------------------
-    # T1c
-    # --------------------------------------------------------
-
-    axes[1].imshow(
-        t1c.T,
-        cmap="gray",
-        origin="lower"
-    )
-
-    axes[1].set_title(
-        "T1c",
-        fontsize=14
-    )
-
-    axes[1].axis("off")
-
-    # --------------------------------------------------------
-    # T2w
-    # --------------------------------------------------------
-
-    axes[2].imshow(
-        t2w.T,
-        cmap="gray",
-        origin="lower"
-    )
-
-    axes[2].set_title(
-        "T2w",
-        fontsize=14
-    )
-
-    axes[2].axis("off")
-
-    # --------------------------------------------------------
-    # T2f
-    # --------------------------------------------------------
-
-    axes[3].imshow(
-        t2f.T,
-        cmap="gray",
-        origin="lower"
-    )
-
-    axes[3].set_title(
-        "T2f",
-        fontsize=14
-    )
-
-    axes[3].axis("off")
-
-    # --------------------------------------------------------
-    # Segmentation
-    # --------------------------------------------------------
-
-    axes[4].imshow(
-        seg_display.T,
-        cmap="viridis",
+    ax.imshow(
+        mask.T,
+        cmap=cmap,
         origin="lower",
         interpolation="nearest",
         vmin=0,
         vmax=3
     )
 
-    axes[4].set_title(
-        "Segmentation",
-        fontsize=14
+    ax.set_title(
+        "Segmentation Mask",
+        fontsize=18
     )
 
-    axes[4].axis("off")
+    ax.axis("off")
 
     # --------------------------------------------------------
-    # Layout
+    # Legend
     # --------------------------------------------------------
 
-    plt.tight_layout(
-        pad=2.0
+    from matplotlib.patches import Patch
+
+    legend_elements = [
+
+        Patch(
+            facecolor="red",
+            label="Enhancing Tumor (ET)"
+        ),
+
+        Patch(
+            facecolor="yellow",
+            label="Tumor Core / NCR-NET (TC)"
+        ),
+
+        Patch(
+            facecolor="purple",
+            label="Edema"
+        ),
+
+        Patch(
+            facecolor="black",
+            edgecolor="white",
+            label="Background"
+        ),
+    ]
+
+    ax.legend(
+        handles=legend_elements,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.02),
+        ncol=2,
+        frameon=False,
+        fontsize=10
     )
 
+    plt.tight_layout()
+
     # --------------------------------------------------------
-    # Output directory
+    # Save
     # --------------------------------------------------------
 
     output_dir = os.path.dirname(
@@ -1217,19 +939,16 @@ def save_visualization(
             exist_ok=True
         )
 
-    # --------------------------------------------------------
-    # Save PNG
-    # --------------------------------------------------------
-
     plt.savefig(
         output_path,
         dpi=200,
-        bbox_inches="tight"
+        bbox_inches="tight",
+        facecolor="white"
     )
 
     print()
     print(
-        "Visualization saved:"
+        "Segmentation mask saved:"
     )
 
     print(
@@ -1237,6 +956,161 @@ def save_visualization(
     )
 
     plt.show()
+
+    plt.close()
+
+
+# ============================================================
+# CHOOSE BEST SLICE
+# ============================================================
+
+def choose_slice(
+    images,
+    prediction,
+    requested_slice=None
+):
+
+    depth = prediction.shape[2]
+
+    # User explicitly selected slice
+    if requested_slice is not None:
+
+        index = int(
+            requested_slice
+        )
+
+        index = max(
+            0,
+            min(
+                index,
+                depth - 1
+            )
+        )
+
+        return index
+
+    # --------------------------------------------------------
+    # Prefer slice with maximum tumor pixels
+    # --------------------------------------------------------
+
+    tumor_counts = []
+
+    for z in range(depth):
+
+        mask = prediction[
+            :,
+            :,
+            z
+        ]
+
+        tumor_pixels = np.count_nonzero(
+            mask
+        )
+
+        tumor_counts.append(
+            tumor_pixels
+        )
+
+    best_slice = int(
+        np.argmax(
+            tumor_counts
+        )
+    )
+
+    # If no tumor was predicted,
+    # use the middle slice.
+    if tumor_counts[best_slice] == 0:
+
+        best_slice = depth // 2
+
+    return best_slice
+
+
+# ============================================================
+# PRINT CLASS INFORMATION
+# ============================================================
+
+def print_prediction_statistics(
+    prediction
+):
+
+    print()
+    print("=" * 70)
+    print("PREDICTION STATISTICS")
+    print("=" * 70)
+
+    total_voxels = prediction.size
+
+    for cls in range(NUM_CLASSES):
+
+        count = np.sum(
+            prediction == cls
+        )
+
+        percentage = (
+            count /
+            total_voxels
+        ) * 100.0
+
+        if cls == 0:
+            name = "Background"
+
+        elif cls == 1:
+            name = "NCR / NET"
+
+        elif cls == 2:
+            name = "Edema"
+
+        else:
+            name = "Enhancing Tumor"
+
+        print(
+            f"Class {cls} "
+            f"({name:20s}): "
+            f"{count:10d} voxels "
+            f"({percentage:.2f}%)"
+        )
+
+    # --------------------------------------------------------
+    # Derived BraTS regions
+    # --------------------------------------------------------
+
+    wt = (
+        prediction > 0
+    )
+
+    tc = (
+        (prediction == 1)
+        |
+        (prediction == 3)
+    )
+
+    et = (
+        prediction == 3
+    )
+
+    print()
+    print(
+        "Derived BraTS regions:"
+    )
+
+    print(
+        "Whole Tumor (WT):",
+        np.sum(wt),
+        "voxels"
+    )
+
+    print(
+        "Tumor Core (TC):",
+        np.sum(tc),
+        "voxels"
+    )
+
+    print(
+        "Enhancing Tumor (ET):",
+        np.sum(et),
+        "voxels"
+    )
 
 
 # ============================================================
@@ -1247,7 +1121,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Full 3D Attention U-Net "
+            "3D Attention U-Net "
             "BraTS prediction"
         )
     )
@@ -1261,8 +1135,8 @@ def main():
         type=str,
         required=True,
         help=(
-            "Patient directory containing "
-            "BraTS .nii.gz files"
+            "Path to ONE patient directory "
+            "containing t1n/t1c/t2w/t2f files"
         )
     )
 
@@ -1278,33 +1152,27 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 3D NIfTI output
+    # NIFTI output
     # --------------------------------------------------------
 
     parser.add_argument(
         "--output-nifti",
         type=str,
-        default="results/segmentation_3d.nii.gz",
-        help=(
-            "Output 3D segmentation NIfTI"
-        )
+        default="results/segmentation_3d.nii.gz"
     )
 
     # --------------------------------------------------------
-    # PNG visualization output
+    # Mask output
     # --------------------------------------------------------
 
     parser.add_argument(
-        "--output-image",
+        "--output-mask",
         type=str,
-        default="results/prediction.png",
-        help=(
-            "Output visualization PNG"
-        )
+        default="results/segmentation_mask.png"
     )
 
     # --------------------------------------------------------
-    # Display slice
+    # Slice
     # --------------------------------------------------------
 
     parser.add_argument(
@@ -1312,8 +1180,9 @@ def main():
         type=int,
         default=None,
         help=(
-            "Axial slice index for visualization. "
-            "If omitted, automatically chooses one."
+            "Axial slice index. "
+            "If omitted, slice with maximum "
+            "predicted tumor is selected."
         )
     )
 
@@ -1344,13 +1213,13 @@ def main():
     )
 
     print(
-        "3D NIfTI output:",
+        "Output NIfTI:",
         args.output_nifti
     )
 
     print(
-        "Visualization output:",
-        args.output_image
+        "Output Mask:",
+        args.output_mask
     )
 
     print("=" * 70)
@@ -1364,7 +1233,7 @@ def main():
     )
 
     # ========================================================
-    # LOAD REFERENCE NIFTI
+    # REFERENCE
     # ========================================================
 
     reference_nifti = get_reference_nifti(
@@ -1372,21 +1241,13 @@ def main():
     )
 
     # ========================================================
-    # LOAD GROUND TRUTH
-    # ========================================================
-
-    ground_truth = load_ground_truth(
-        args.data_dir
-    )
-
-    # ========================================================
-    # CREATE MODEL
+    # MODEL
     # ========================================================
 
     model = create_model()
 
     # ========================================================
-    # LOAD CHECKPOINT
+    # CHECKPOINT
     # ========================================================
 
     model = load_checkpoint(
@@ -1417,29 +1278,19 @@ def main():
         volume=volume
     )
 
-    # ========================================================
-    # PREDICTION INFORMATION
-    # ========================================================
-
-    unique_classes = np.unique(
-        prediction
-    )
-
     print()
     print(
-        "Predicted classes:",
-        unique_classes
+        "Prediction shape:",
+        prediction.shape
     )
 
-    for cls in unique_classes:
+    # ========================================================
+    # STATISTICS
+    # ========================================================
 
-        count = np.sum(
-            prediction == cls
-        )
-
-        print(
-            f"Class {cls}: {count} voxels"
-        )
+    print_prediction_statistics(
+        prediction
+    )
 
     # ========================================================
     # SAVE 3D NIFTI
@@ -1452,29 +1303,29 @@ def main():
     )
 
     # ========================================================
-    # CHOOSE VISUALIZATION SLICE
+    # CHOOSE SLICE
     # ========================================================
 
     slice_index = choose_slice(
         images,
+        prediction,
         args.slice
     )
 
     print()
     print(
-        "Visualization slice:",
+        "Selected visualization slice:",
         slice_index
     )
 
     # ========================================================
-    # SAVE PNG VISUALIZATION
+    # SAVE MASK ONLY
     # ========================================================
 
-    save_visualization(
-        images=images,
+    save_segmentation_mask(
         prediction=prediction,
         slice_index=slice_index,
-        output_path=args.output_image
+        output_path=args.output_mask
     )
 
     # ========================================================
@@ -1492,22 +1343,41 @@ def main():
     )
 
     print(
-        args.output_nifti
+        os.path.abspath(
+            args.output_nifti
+        )
     )
 
     print()
     print(
-        "2D visualization:"
+        "Segmentation mask:"
     )
 
     print(
-        args.output_image
+        os.path.abspath(
+            args.output_mask
+        )
     )
 
     print()
     print(
-        "Your friend can use the .nii.gz file "
-        "for further 3D processing."
+        "The PNG contains ONLY the segmentation mask."
+    )
+
+    print(
+        "Background = Black"
+    )
+
+    print(
+        "NCR/NET / Tumor Core = Yellow"
+    )
+
+    print(
+        "Edema = Purple"
+    )
+
+    print(
+        "Enhancing Tumor = Red"
     )
 
 

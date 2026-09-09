@@ -14,8 +14,12 @@ data/processed/
 # Dataset split files
 data/splits/
 
-# Models - temporarily not committed
-models/
+# Model weights / checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Temporary test files
 tests/
 
 # Temporary test

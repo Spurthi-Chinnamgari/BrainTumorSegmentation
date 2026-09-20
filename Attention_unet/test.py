@@ -35,7 +35,7 @@ from dataset import (
     ComposeTransforms,
 )
 from models import AttentionUNet2D, AttentionUNet3D
-from metrics import (
+from postprocessing.metrics import (
     compute_dice_score,
     compute_iou_score,
     compute_precision_recall_f1,

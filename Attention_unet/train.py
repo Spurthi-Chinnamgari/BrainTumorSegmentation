@@ -69,7 +69,7 @@ from models import AttentionUNet3D
 
 from losses import DiceBCELoss
 
-from metrics import (
+from postprocessing.metrics import (
     compute_dice_score,
     compute_iou_score,
     compute_brats_regions_metrics,

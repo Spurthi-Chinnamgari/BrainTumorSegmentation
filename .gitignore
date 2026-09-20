@@ -1,0 +1,15 @@
+# Python virtual environment
+.venv/
+
+# Input medical imaging data
+input/
+
+# Generated post-processing outputs
+postprocessed/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated feature extraction output
+feature_extraction_results.csv

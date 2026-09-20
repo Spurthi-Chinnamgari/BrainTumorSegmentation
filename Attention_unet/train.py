@@ -1,20 +1,26 @@
 """
-Fast 3D Training Pipeline
--------------------------
+3D Attention U-Net Training Pipeline
+------------------------------------
 
-3D Attention U-Net for BraTS 2023 multimodal brain tumor
-segmentation.
+Uses the VERIFIED preprocessing output.
 
-REAL BraTS DATA ONLY.
+Pipeline:
 
-Input modalities:
-    1. T1 native  -> t1n
-    2. T1ce       -> t1c
-    3. T2         -> t2w
-    4. FLAIR      -> t2f
-
-Ground Truth:
-    *_seg.nii.gz
+Raw BraTS 2023
+      ↓
+Verified preprocessing
+      ↓
+Normalization + cropping
+      ↓
+64 x 64 x 64 patches
+      ↓
+images.npy / masks.npy
+      ↓
+Exact train / val / test split
+      ↓
+3D Attention U-Net
+      ↓
+4-class segmentation
 
 Classes:
     0 = Background
@@ -22,20 +28,13 @@ Classes:
     2 = Edema
     3 = Enhancing Tumor
 
-Training:
-    100 real BraTS patients
-
-Validation:
-    20 real BraTS patients
-
-Training patch:
-    (16, 32, 32)
-
-Validation:
-    Full 3D volume using fast sliding-window inference.
-
 IMPORTANT:
-    This file does NOT generate or use synthetic data.
+    This file does NOT perform:
+        - Z-score normalization
+        - random cropping
+        - random patient splitting
+
+Those steps are already handled by preprocessing.
 """
 
 
@@ -43,7 +42,6 @@ import os
 import time
 import argparse
 
-import numpy as np
 import torch
 import torch.optim as optim
 
@@ -54,15 +52,7 @@ from configs import get_default_config
 
 from dataset import (
     BraTSDataset3D,
-    create_train_val_test_split,
-)
-
-from dataset.transforms import (
-    ComposeTransforms,
-    ZScoreNormalize,
-    RandomCrop3D,
-    RandomFlip3D,
-    ToTensor,
+    read_split_file,
 )
 
 from models import AttentionUNet3D
@@ -85,249 +75,332 @@ from utils import (
 
 
 # ============================================================
-# SETTINGS
+# CONSTANTS
 # ============================================================
 
-PATCH_SIZE = (16, 32, 32)
-
-# ============================================================
-# FAST VALIDATION
-#
-# Same patch size, but NO overlap.
-#
-# Old:
-# STRIDE = (8, 16, 16)
-#
-# New:
-# STRIDE = PATCH_SIZE
-#
-# This greatly reduces the number of validation patches.
-# ============================================================
-
-STRIDE = PATCH_SIZE
+PATCH_SIZE = (64, 64, 64)
 
 NUM_CLASSES = 4
-
 NUM_MODALITIES = 4
 
-MAX_TRAIN_PATIENTS = 100
+# Exact verified split
+EXPECTED_TRAIN_PATIENTS = 26
+EXPECTED_VAL_PATIENTS = 6
+EXPECTED_TEST_PATIENTS = 5
 
-MAX_VAL_PATIENTS = 20
-
-# Validate every 5 epochs.
-# Set to 1 if you want validation after every epoch.
-VALIDATE_EVERY = 5
-
-
-# ============================================================
-# PATCH POSITION GENERATOR
-# ============================================================
-
-def get_positions(size, patch, stride):
-    """
-    Generate sliding-window starting positions.
-
-    The final position is always included so that the complete
-    volume is covered.
-    """
-
-    if size <= patch:
-        return [0]
-
-    positions = []
-
-    pos = 0
-
-    while pos + patch < size:
-
-        positions.append(pos)
-
-        pos += stride
-
-    last = size - patch
-
-    if len(positions) == 0 or positions[-1] != last:
-        positions.append(last)
-
-    return positions
+# Validate every epoch because validation is now patch based
+VALIDATE_EVERY = 1
 
 
 # ============================================================
-# PAD VOLUME
+# FIND PROCESSED DATA
 # ============================================================
 
-def pad_volume(image, patch_size):
-    """
-    Pad image only when smaller than patch size.
-
-    image:
-        (B, C, D, H, W)
-    """
-
-    _, _, d, h, w = image.shape
-
-    pd = max(0, patch_size[0] - d)
-    ph = max(0, patch_size[1] - h)
-    pw = max(0, patch_size[2] - w)
-
-    if pd == 0 and ph == 0 and pw == 0:
-        return image, (0, 0, 0)
-
-    image = torch.nn.functional.pad(
-        image,
-        (
-            0, pw,
-            0, ph,
-            0, pd,
-        ),
-        mode="constant",
-        value=0,
-    )
-
-    return image, (pd, ph, pw)
-
-
-# ============================================================
-# FAST 3D SLIDING-WINDOW PREDICTION
-# ============================================================
-
-def sliding_window_prediction(
-    model,
-    image,
-    device,
-    patch_size=PATCH_SIZE,
-    stride=STRIDE,
+def find_data_paths(
+    processed_root=None,
+    split_root=None,
 ):
     """
-    Predict a complete 3D MRI volume.
+    Automatically locate the preprocessing output.
 
-    Input:
-        image = (1, 4, D, H, W)
+    Possible structures supported:
 
-    Output:
-        prediction = (D, H, W)
+        BrainTumorSegmentation/
+        ├── preprocessing/
+        │   └── data/
+        │       ├── processed/
+        │       └── splits/
+        │
+        └── Attention_unet/
 
-    This version uses fast non-overlapping validation
-    because STRIDE == PATCH_SIZE.
+    OR:
+
+        BrainTumorSegmentation/
+        ├── data/
+        │   ├── processed/
+        │   └── splits/
+        │
+        └── Attention_unet/
     """
 
-    _, _, D, H, W = image.shape
-
-    pd, ph, pw = patch_size
-
-    d_positions = get_positions(
-        D,
-        pd,
-        stride[0],
+    current_dir = os.path.dirname(
+        os.path.abspath(__file__)
     )
 
-    h_positions = get_positions(
-        H,
-        ph,
-        stride[1],
+    project_root = os.path.dirname(
+        current_dir
     )
 
-    w_positions = get_positions(
-        W,
-        pw,
-        stride[2],
-    )
+    # --------------------------------------------------------
+    # User supplied paths have highest priority
+    # --------------------------------------------------------
 
-    logits_sum = torch.zeros(
-        (
-            1,
-            NUM_CLASSES,
-            D,
-            H,
-            W,
+    if processed_root is not None:
+        processed_root = os.path.abspath(
+            processed_root
+        )
+
+    if split_root is not None:
+        split_root = os.path.abspath(
+            split_root
+        )
+
+    # --------------------------------------------------------
+    # Candidate locations
+    # --------------------------------------------------------
+
+    processed_candidates = [
+        os.path.join(
+            project_root,
+            "preprocessing",
+            "data",
+            "processed",
         ),
-        dtype=torch.float32,
-        device=device,
-    )
 
-    count_map = torch.zeros(
-        (
-            1,
-            1,
-            D,
-            H,
-            W,
+        os.path.join(
+            project_root,
+            "data",
+            "processed",
         ),
-        dtype=torch.float32,
-        device=device,
+
+        os.path.join(
+            current_dir,
+            "data",
+            "processed",
+        ),
+
+        os.path.join(
+            os.getcwd(),
+            "preprocessing",
+            "data",
+            "processed",
+        ),
+
+        os.path.join(
+            os.getcwd(),
+            "data",
+            "processed",
+        ),
+    ]
+
+    split_candidates = [
+        os.path.join(
+            project_root,
+            "preprocessing",
+            "data",
+            "splits",
+        ),
+
+        os.path.join(
+            project_root,
+            "data",
+            "splits",
+        ),
+
+        os.path.join(
+            current_dir,
+            "data",
+            "splits",
+        ),
+
+        os.path.join(
+            os.getcwd(),
+            "preprocessing",
+            "data",
+            "splits",
+        ),
+
+        os.path.join(
+            os.getcwd(),
+            "data",
+            "splits",
+        ),
+    ]
+
+    # --------------------------------------------------------
+    # Resolve processed root
+    # --------------------------------------------------------
+
+    if processed_root is None:
+
+        for path in processed_candidates:
+
+            if os.path.isdir(path):
+
+                processed_root = path
+                break
+
+    # --------------------------------------------------------
+    # Resolve split root
+    # --------------------------------------------------------
+
+    if split_root is None:
+
+        for path in split_candidates:
+
+            if os.path.isdir(path):
+
+                split_root = path
+                break
+
+    # --------------------------------------------------------
+    # Validate
+    # --------------------------------------------------------
+
+    if processed_root is None:
+
+        raise FileNotFoundError(
+            "\nCould not find processed data.\n\n"
+            "Expected one of:\n"
+            + "\n".join(processed_candidates)
+            + "\n\n"
+            "Use --processed-root to specify it manually."
+        )
+
+    if split_root is None:
+
+        raise FileNotFoundError(
+            "\nCould not find split files.\n\n"
+            "Expected one of:\n"
+            + "\n".join(split_candidates)
+            + "\n\n"
+            "Use --split-root to specify it manually."
+        )
+
+    return (
+        os.path.abspath(processed_root),
+        os.path.abspath(split_root),
     )
 
-    model.eval()
 
-    total = (
-        len(d_positions)
-        * len(h_positions)
-        * len(w_positions)
+# ============================================================
+# VERIFY SPLITS
+# ============================================================
+
+def verify_splits(
+    split_root,
+):
+    """
+    Verify the exact preprocessing split.
+
+    Expected:
+        train = 26
+        val   = 6
+        test  = 5
+    """
+
+    train_file = os.path.join(
+        split_root,
+        "train.txt",
     )
 
-    with torch.no_grad():
-
-        for d in d_positions:
-
-            for h in h_positions:
-
-                for w in w_positions:
-
-                    patch = image[
-                        :,
-                        :,
-                        d:d + pd,
-                        h:h + ph,
-                        w:w + pw,
-                    ].to(
-                        device,
-                        non_blocking=True,
-                    )
-
-                    # ----------------------------------------
-                    # AMP inference
-                    # ----------------------------------------
-
-                    if device.type == "cuda":
-
-                        with torch.amp.autocast(
-                            device_type="cuda"
-                        ):
-                            logits = model(patch)
-
-                    else:
-
-                        logits = model(patch)
-
-                    logits_sum[
-                        :,
-                        :,
-                        d:d + pd,
-                        h:h + ph,
-                        w:w + pw,
-                    ] += logits.float()
-
-                    count_map[
-                        :,
-                        :,
-                        d:d + pd,
-                        h:h + ph,
-                        w:w + pw,
-                    ] += 1.0
-
-    logits_average = (
-        logits_sum /
-        count_map.clamp_min(1.0)
+    val_file = os.path.join(
+        split_root,
+        "val.txt",
     )
 
-    prediction = torch.argmax(
-        logits_average,
-        dim=1,
+    test_file = os.path.join(
+        split_root,
+        "test.txt",
     )
 
-    prediction = prediction.squeeze(0)
+    train_ids = read_split_file(
+        train_file
+    )
 
-    return prediction.cpu().numpy()
+    val_ids = read_split_file(
+        val_file
+    )
+
+    test_ids = read_split_file(
+        test_file
+    )
+
+    # --------------------------------------------------------
+    # Check counts
+    # --------------------------------------------------------
+
+    if len(train_ids) != EXPECTED_TRAIN_PATIENTS:
+
+        raise ValueError(
+            "\nTrain split mismatch.\n"
+            f"Expected: {EXPECTED_TRAIN_PATIENTS}\n"
+            f"Found:    {len(train_ids)}\n"
+            f"File:     {train_file}"
+        )
+
+    if len(val_ids) != EXPECTED_VAL_PATIENTS:
+
+        raise ValueError(
+            "\nValidation split mismatch.\n"
+            f"Expected: {EXPECTED_VAL_PATIENTS}\n"
+            f"Found:    {len(val_ids)}\n"
+            f"File:     {val_file}"
+        )
+
+    if len(test_ids) != EXPECTED_TEST_PATIENTS:
+
+        raise ValueError(
+            "\nTest split mismatch.\n"
+            f"Expected: {EXPECTED_TEST_PATIENTS}\n"
+            f"Found:    {len(test_ids)}\n"
+            f"File:     {test_file}"
+        )
+
+    # --------------------------------------------------------
+    # Check for overlap
+    # --------------------------------------------------------
+
+    train_set = set(train_ids)
+    val_set = set(val_ids)
+    test_set = set(test_ids)
+
+    if train_set & val_set:
+
+        raise ValueError(
+            "Train and validation sets overlap."
+        )
+
+    if train_set & test_set:
+
+        raise ValueError(
+            "Train and test sets overlap."
+        )
+
+    if val_set & test_set:
+
+        raise ValueError(
+            "Validation and test sets overlap."
+        )
+
+    print()
+    print("=" * 70)
+    print("EXACT PREPROCESSING SPLIT")
+    print("=" * 70)
+
+    print(
+        f"Train patients : {len(train_ids)}"
+    )
+
+    print(
+        f"Val patients   : {len(val_ids)}"
+    )
+
+    print(
+        f"Test patients  : {len(test_ids)}"
+    )
+
+    print(
+        "No patient overlap detected."
+    )
+
+    print("=" * 70)
+
+    return (
+        train_ids,
+        val_ids,
+        test_ids,
+    )
 
 
 # ============================================================
@@ -367,12 +440,61 @@ def train_one_epoch(
             non_blocking=True,
         )
 
+        # ====================================================
+        # OPTIONAL PATCH AUGMENTATION
+        #
+        # Preprocessing has already normalized and cropped.
+        # We therefore DO NOT normalize or crop again.
+        #
+        # Random spatial flips are safe to apply here.
+        # ====================================================
+
+        if torch.rand(1).item() < 0.5:
+
+            images = torch.flip(
+                images,
+                dims=[2],
+            )
+
+            masks = torch.flip(
+                masks,
+                dims=[1],
+            )
+
+        if torch.rand(1).item() < 0.5:
+
+            images = torch.flip(
+                images,
+                dims=[3],
+            )
+
+            masks = torch.flip(
+                masks,
+                dims=[2],
+            )
+
+        if torch.rand(1).item() < 0.5:
+
+            images = torch.flip(
+                images,
+                dims=[4],
+            )
+
+            masks = torch.flip(
+                masks,
+                dims=[3],
+            )
+
+        # ====================================================
+        # ZERO GRADIENT
+        # ====================================================
+
         optimizer.zero_grad(
             set_to_none=True
         )
 
         # ====================================================
-        # AMP TRAINING
+        # FORWARD + LOSS
         # ====================================================
 
         if scaler is not None:
@@ -381,7 +503,9 @@ def train_one_epoch(
                 device_type="cuda"
             ):
 
-                logits = model(images)
+                logits = model(
+                    images
+                )
 
                 loss = criterion(
                     logits,
@@ -400,7 +524,9 @@ def train_one_epoch(
 
         else:
 
-            logits = model(images)
+            logits = model(
+                images
+            )
 
             loss = criterion(
                 logits,
@@ -412,7 +538,27 @@ def train_one_epoch(
             optimizer.step()
 
         # ====================================================
-        # TRAIN DICE
+        # OUTPUT SHAPE CHECK
+        # ====================================================
+
+        if logits.ndim != 5:
+
+            raise RuntimeError(
+                "\nUnexpected model output.\n"
+                f"Expected: (B, 4, 64, 64, 64)\n"
+                f"Got:      {tuple(logits.shape)}"
+            )
+
+        if logits.shape[1] != NUM_CLASSES:
+
+            raise RuntimeError(
+                "\nUnexpected number of output classes.\n"
+                f"Expected: {NUM_CLASSES}\n"
+                f"Got:      {logits.shape[1]}"
+            )
+
+        # ====================================================
+        # DICE
         # ====================================================
 
         with torch.no_grad():
@@ -456,7 +602,7 @@ def train_one_epoch(
 
 
 # ============================================================
-# FAST FULL-VOLUME VALIDATION
+# VALIDATION
 # ============================================================
 
 def validate(
@@ -468,6 +614,8 @@ def validate(
 ):
 
     model.eval()
+
+    loss_tracker = MetricTracker()
 
     dice_tracker = MetricTracker()
 
@@ -488,123 +636,140 @@ def validate(
 
     with torch.no_grad():
 
-        for batch_index, batch in enumerate(pbar):
+        for batch_index, batch in enumerate(
+            pbar
+        ):
 
-            images = batch["image"]
-
-            masks = batch["mask"]
-
-            # ------------------------------------------------
-            # Validation batch size = 1
-            # ------------------------------------------------
-
-            if images.ndim == 4:
-                images = images.unsqueeze(0)
-
-            if masks.ndim == 3:
-                masks = masks.unsqueeze(0)
-
-            original_shape = images.shape[2:]
-
-            # ------------------------------------------------
-            # Pad if necessary
-            # ------------------------------------------------
-
-            images_padded, _ = pad_volume(
-                images,
-                PATCH_SIZE,
+            images = batch["image"].to(
+                device,
+                non_blocking=True,
             )
 
-            # ------------------------------------------------
-            # FULL 3D PREDICTION
-            # ------------------------------------------------
-
-            prediction_np = sliding_window_prediction(
-                model=model,
-                image=images_padded,
-                device=device,
-                patch_size=PATCH_SIZE,
-                stride=STRIDE,
+            masks = batch["mask"].to(
+                device,
+                non_blocking=True,
             )
 
-            # ------------------------------------------------
-            # Remove padding
-            # ------------------------------------------------
+            # =================================================
+            # FORWARD
+            # =================================================
 
-            D, H, W = original_shape
+            if device.type == "cuda":
 
-            prediction_np = prediction_np[
-                :D,
-                :H,
-                :W,
-            ]
+                with torch.amp.autocast(
+                    device_type="cuda"
+                ):
 
-            predictions = torch.from_numpy(
-                prediction_np
-            ).long().to(device)
+                    logits = model(
+                        images
+                    )
 
-            masks_device = masks.to(device)
+                    loss = criterion(
+                        logits,
+                        masks,
+                    )
+
+            else:
+
+                logits = model(
+                    images
+                )
+
+                loss = criterion(
+                    logits,
+                    masks,
+                )
+
+            # =================================================
+            # PREDICTION
+            # =================================================
+
+            predictions = torch.argmax(
+                logits,
+                dim=1,
+            )
 
             # =================================================
             # METRICS
             # =================================================
 
             mean_dice, _ = compute_dice_score(
-                predictions.unsqueeze(0),
-                masks_device,
+                predictions,
+                masks,
             )
 
             mean_iou, _ = compute_iou_score(
-                predictions.unsqueeze(0),
-                masks_device,
+                predictions,
+                masks,
             )
 
             brats_metrics = (
                 compute_brats_regions_metrics(
-                    predictions.unsqueeze(0),
-                    masks_device,
+                    predictions,
+                    masks,
                 )
+            )
+
+            batch_size = images.size(0)
+
+            loss_tracker.update(
+                loss.item(),
+                batch_size,
             )
 
             dice_tracker.update(
                 mean_dice,
-                1,
+                batch_size,
             )
 
             iou_tracker.update(
                 mean_iou,
-                1,
+                batch_size,
             )
 
             wt_tracker.update(
                 brats_metrics["dice_wt"],
-                1,
+                batch_size,
             )
 
             tc_tracker.update(
                 brats_metrics["dice_tc"],
-                1,
+                batch_size,
             )
 
             et_tracker.update(
                 brats_metrics["dice_et"],
-                1,
+                batch_size,
             )
 
             # =================================================
-            # SAVE FIRST VALIDATION PATIENT
+            # FIRST VALIDATION SAMPLE
             # =================================================
 
             if batch_index == 0:
 
                 sample_for_viz = (
-                    images[0].cpu().numpy(),
-                    masks[0].cpu().numpy(),
-                    prediction_np,
+                    images[0]
+                    .detach()
+                    .cpu()
+                    .numpy(),
+
+                    masks[0]
+                    .detach()
+                    .cpu()
+                    .numpy(),
+
+                    predictions[0]
+                    .detach()
+                    .cpu()
+                    .numpy(),
                 )
 
             pbar.set_postfix(
                 {
+                    "Loss":
+                        f"{loss_tracker.avg:.4f}",
+
                     "Dice":
                         f"{dice_tracker.avg:.4f}",
 
@@ -623,7 +788,8 @@ def validate(
             )
 
     return {
-        "val_loss": 0.0,
+        "val_loss":
+            loss_tracker.avg,
 
         "val_dice":
             dice_tracker.avg,
@@ -654,7 +820,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Train 3D Attention U-Net "
-            "using REAL BraTS 2023 data"
+            "using verified processed BraTS data."
         )
     )
 
@@ -667,7 +833,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
+        default=1,
     )
 
     parser.add_argument(
@@ -677,9 +843,21 @@ def main():
     )
 
     parser.add_argument(
-        "--data-dir",
+        "--processed-root",
         type=str,
         default=None,
+        help=(
+            "Path to data/processed"
+        ),
+    )
+
+    parser.add_argument(
+        "--split-root",
+        type=str,
+        default=None,
+        help=(
+            "Path to data/splits"
+        ),
     )
 
     parser.add_argument(
@@ -709,29 +887,32 @@ def main():
 
     cfg.train.learning_rate = args.lr
 
-    cfg.train.early_stopping_patience = args.patience
-
-    # --------------------------------------------------------
-    # Data directory
-    # --------------------------------------------------------
-
-    if args.data_dir is not None:
-
-        cfg.dataset.data_dir = args.data_dir
+    cfg.train.early_stopping_patience = (
+        args.patience
+    )
 
     # ========================================================
-    # CHECK DATASET
+    # FIND PROCESSED DATA
     # ========================================================
 
-    if not os.path.exists(
-        cfg.dataset.data_dir
-    ):
-
-        raise FileNotFoundError(
-            "\nBraTS dataset directory was not found:\n"
-            f"{cfg.dataset.data_dir}\n\n"
-            "Please check config.py or use --data-dir."
+    processed_root, split_root = (
+        find_data_paths(
+            processed_root=args.processed_root,
+            split_root=args.split_root,
         )
+    )
+
+    # ========================================================
+    # VERIFY SPLIT
+    # ========================================================
+
+    (
+        train_ids,
+        val_ids,
+        test_ids,
+    ) = verify_splits(
+        split_root
+    )
 
     # ========================================================
     # DEVICE
@@ -743,62 +924,61 @@ def main():
         else "cpu"
     )
 
+    # ========================================================
+    # HEADER
+    # ========================================================
+
     print()
-
+    print("=" * 70)
+    print("3D ATTENTION U-NET TRAINING")
     print("=" * 70)
 
     print(
-        "3D ATTENTION U-NET TRAINING"
-    )
-
-    print("=" * 70)
-
-    print(
-        "DATA TYPE       : REAL BraTS 2023"
+        "Data source       : VERIFIED PREPROCESSED DATA"
     )
 
     print(
-        "GROUND TRUTH    : *-seg.nii.gz"
+        "Input modalities  : 4"
     )
 
     print(
-        "Device          :",
-        device,
-    )
-
-    print(
-        "Training patch  :",
+        "Patch size        :",
         PATCH_SIZE,
     )
 
     print(
-        "Validation stride:",
-        STRIDE,
-    )
-
-    print(
-        "Validation frequency:",
-        f"Every {VALIDATE_EVERY} epochs",
-    )
-
-    print(
-        "Classes         :",
+        "Output classes    :",
         NUM_CLASSES,
     )
 
     print(
-        "Train patients  :",
-        MAX_TRAIN_PATIENTS,
+        "Train patients    :",
+        len(train_ids),
     )
 
     print(
-        "Val patients    :",
-        MAX_VAL_PATIENTS,
+        "Validation patients:",
+        len(val_ids),
     )
 
     print(
-        "Data directory  :",
-        cfg.dataset.data_dir,
+        "Test patients     :",
+        len(test_ids),
+    )
+
+    print(
+        "Device            :",
+        device,
+    )
+
+    print(
+        "Processed root    :",
+        processed_root,
+    )
+
+    print(
+        "Split root        :",
+        split_root,
     )
 
     print("=" * 70)
@@ -815,122 +995,8 @@ def main():
     )
 
     logger.info(
-        "Starting REAL BraTS 2023 training"
-    )
-
-    # ========================================================
-    # DATASET SPLIT
-    # ========================================================
-
-    print()
-
-    print(
-        "Creating train/validation/test split..."
-    )
-
-    train_dirs, val_dirs, test_dirs = (
-        create_train_val_test_split(
-            data_dir=cfg.dataset.data_dir,
-            val_split=cfg.dataset.val_split,
-            test_split=cfg.dataset.test_split,
-            seed=cfg.dataset.seed,
-        )
-    )
-
-    # ========================================================
-    # LIMIT DATASET
-    # ========================================================
-
-    train_dirs = train_dirs[
-        :MAX_TRAIN_PATIENTS
-    ]
-
-    val_dirs = val_dirs[
-        :MAX_VAL_PATIENTS
-    ]
-
-    # ========================================================
-    # CHECK DATA
-    # ========================================================
-
-    if len(train_dirs) == 0:
-
-        raise RuntimeError(
-            "No real BraTS training patients found."
-        )
-
-    if len(val_dirs) == 0:
-
-        raise RuntimeError(
-            "No real BraTS validation patients found."
-        )
-
-    # ========================================================
-    # PATIENT COUNTS
-    # ========================================================
-
-    print()
-
-    print(
-        "Training patients  :",
-        len(train_dirs),
-    )
-
-    print(
-        "Validation patients:",
-        len(val_dirs),
-    )
-
-    print(
-        "Test patients      :",
-        len(test_dirs),
-    )
-
-    print()
-
-    print(
-        "Ground-truth masks:"
-    )
-
-    print(
-        "Each patient uses its corresponding "
-        "*-seg.nii.gz file."
-    )
-
-    # ========================================================
-    # TRANSFORMS
-    # ========================================================
-
-    train_transform = ComposeTransforms(
-        [
-
-            ZScoreNormalize(),
-
-            RandomCrop3D(
-                patch_size=PATCH_SIZE
-            ),
-
-            RandomFlip3D(
-                prob=0.5
-            ),
-
-            ToTensor(),
-
-        ]
-    )
-
-    # --------------------------------------------------------
-    # NO RANDOM CROP FOR VALIDATION
-    # --------------------------------------------------------
-
-    val_transform = ComposeTransforms(
-        [
-
-            ZScoreNormalize(),
-
-            ToTensor(),
-
-        ]
+        "Starting Attention U-Net training "
+        "using verified processed BraTS data."
     )
 
     # ========================================================
@@ -938,40 +1004,138 @@ def main():
     # ========================================================
 
     print()
-
     print(
-        "Loading REAL BraTS training dataset..."
+        "Loading processed training dataset..."
     )
 
     train_ds = BraTSDataset3D(
-        train_dirs,
-        modalities=cfg.dataset.modalities,
-        transform=train_transform,
-        is_train=True,
-    )
-
-    print(
-        "Loading REAL BraTS validation dataset..."
-    )
-
-    val_ds = BraTSDataset3D(
-        val_dirs,
-        modalities=cfg.dataset.modalities,
-        transform=val_transform,
-        is_train=False,
+        processed_root=processed_root,
+        split="train",
+        split_file=os.path.join(
+            split_root,
+            "train.txt",
+        ),
+        patch_size=PATCH_SIZE,
     )
 
     print()
+    print(
+        "Loading processed validation dataset..."
+    )
+
+    val_ds = BraTSDataset3D(
+        processed_root=processed_root,
+        split="val",
+        split_file=os.path.join(
+            split_root,
+            "val.txt",
+        ),
+        patch_size=PATCH_SIZE,
+    )
+
+    # ========================================================
+    # DATASET COUNTS
+    # ========================================================
+
+    print()
+    print("=" * 70)
 
     print(
-        "Train dataset size:",
-        len(train_ds),
+        "PROCESSED DATASET"
+    )
+
+    print("=" * 70)
+
+    print(
+        f"Train patients : {len(train_ids)}"
     )
 
     print(
-        "Validation dataset size:",
-        len(val_ds),
+        f"Train patches  : {len(train_ds)}"
     )
+
+    print(
+        f"Val patients   : {len(val_ids)}"
+    )
+
+    print(
+        f"Val patches     : {len(val_ds)}"
+    )
+
+    print(
+        f"Test patients  : {len(test_ids)}"
+    )
+
+    print("=" * 70)
+
+    # ========================================================
+    # VERIFY ONE SAMPLE
+    # ========================================================
+
+    sample = train_ds[0]
+
+    sample_image = sample["image"]
+    sample_mask = sample["mask"]
+
+    print()
+    print(
+        "FIRST PROCESSED SAMPLE"
+    )
+
+    print(
+        "Image shape:",
+        tuple(sample_image.shape),
+    )
+
+    print(
+        "Mask shape :",
+        tuple(sample_mask.shape),
+    )
+
+    print(
+        "Image dtype:",
+        sample_image.dtype,
+    )
+
+    print(
+        "Mask dtype :",
+        sample_mask.dtype,
+    )
+
+    print(
+        "Patient    :",
+        sample["patient_id"],
+    )
+
+    print(
+        "Patch      :",
+        sample["patch_index"],
+    )
+
+    expected_image_shape = (
+        NUM_MODALITIES,
+        *PATCH_SIZE
+    )
+
+    if tuple(sample_image.shape) != (
+        expected_image_shape
+    ):
+
+        raise RuntimeError(
+            "\nProcessed image shape is wrong.\n"
+            f"Expected: {expected_image_shape}\n"
+            f"Got:      {tuple(sample_image.shape)}"
+        )
+
+    if tuple(sample_mask.shape) != (
+        PATCH_SIZE
+    ):
+
+        raise RuntimeError(
+            "\nProcessed mask shape is wrong.\n"
+            f"Expected: {PATCH_SIZE}\n"
+            f"Got:      {tuple(sample_mask.shape)}"
+        )
 
     # ========================================================
     # DATALOADERS
@@ -998,18 +1162,61 @@ def main():
     )
 
     # ========================================================
+    # VERIFY BATCH SHAPE
+    # ========================================================
+
+    first_batch = next(
+        iter(train_loader)
+    )
+
+    print()
+    print(
+        "FIRST TRAIN BATCH"
+    )
+
+    print(
+        "Image batch:",
+        tuple(
+            first_batch["image"].shape
+        ),
+    )
+
+    print(
+        "Mask batch :",
+        tuple(
+            first_batch["mask"].shape
+        ),
+    )
+
+    expected_batch_shape = (
+        cfg.train.batch_size,
+        NUM_MODALITIES,
+        *PATCH_SIZE
+    )
+
+    if tuple(
+        first_batch["image"].shape
+    ) != expected_batch_shape:
+
+        raise RuntimeError(
+            "\nIncorrect batch entering model.\n"
+            f"Expected: {expected_batch_shape}\n"
+            f"Got:      "
+            f"{tuple(first_batch['image'].shape)}"
+        )
+
+    # ========================================================
     # MODEL
     # ========================================================
 
     print()
-
     print(
         "Creating Attention U-Net 3D..."
     )
 
     model = AttentionUNet3D(
-        in_channels=4,
-        out_channels=4,
+        in_channels=NUM_MODALITIES,
+        out_channels=NUM_CLASSES,
 
         features=[
             16,
@@ -1023,6 +1230,81 @@ def main():
 
         use_transpose=True,
     ).to(device)
+
+    # ========================================================
+    # MODEL OUTPUT VERIFICATION
+    # ========================================================
+
+    print(
+        "Checking model input/output shapes..."
+    )
+
+    model.eval()
+
+    with torch.no_grad():
+
+        test_input = first_batch[
+            "image"
+        ][:1].to(device)
+
+        test_output = model(
+            test_input
+        )
+
+    expected_output_shape = (
+        1,
+        NUM_CLASSES,
+        *PATCH_SIZE
+    )
+
+    print(
+        "Model input :",
+        tuple(test_input.shape),
+    )
+
+    print(
+        "Model output:",
+        tuple(test_output.shape),
+    )
+
+    if tuple(
+        test_output.shape
+    ) != expected_output_shape:
+
+        raise RuntimeError(
+            "\nUnexpected Attention U-Net output.\n"
+            f"Expected: {expected_output_shape}\n"
+            f"Got:      {tuple(test_output.shape)}"
+        )
+
+    test_prediction = torch.argmax(
+        test_output,
+        dim=1,
+    )
+
+    print(
+        "Argmax output:",
+        tuple(
+            test_prediction.shape
+        ),
+    )
+
+    print(
+        "Initial prediction labels:",
+        torch.unique(
+            test_prediction
+        ).detach().cpu().tolist(),
+    )
+
+    del test_input
+    del test_output
+    del test_prediction
+
+    if device.type == "cuda":
+
+        torch.cuda.empty_cache()
+
+    model.train()
 
     # ========================================================
     # LOSS
@@ -1102,33 +1384,17 @@ def main():
     )
 
     # ========================================================
-    # TRAINING LOOP
+    # TRAINING
     # ========================================================
 
     best_val_dice = 0.0
 
     patience_counter = 0
 
-    last_val_metrics = {
-        "val_dice": 0.0,
-        "val_iou": 0.0,
-        "val_dice_wt": 0.0,
-        "val_dice_tc": 0.0,
-        "val_dice_et": 0.0,
-        "sample_viz": None,
-    }
-
     print()
-
     print("=" * 70)
-
-    print(
-        "STARTING TRAINING"
-    )
-
+    print("STARTING TRAINING")
     print("=" * 70)
-
-    print()
 
     for epoch in range(
         1,
@@ -1153,39 +1419,15 @@ def main():
 
         # ====================================================
         # VALIDATION
-        #
-        # Only every N epochs.
-        # Always validate on the final epoch.
         # ====================================================
 
-        should_validate = (
-            epoch % VALIDATE_EVERY == 0
-            or epoch == cfg.train.epochs
+        val_metrics = validate(
+            model=model,
+            dataloader=val_loader,
+            criterion=criterion,
+            device=device,
+            epoch=epoch,
         )
-
-        if should_validate:
-
-            val_metrics = validate(
-                model=model,
-                dataloader=val_loader,
-                criterion=criterion,
-                device=device,
-                epoch=epoch,
-            )
-
-            last_val_metrics = val_metrics
-
-        else:
-
-            val_metrics = last_val_metrics
-
-            print()
-
-            print(
-                f"Skipping validation for epoch {epoch}. "
-                f"Next validation at epoch "
-                f"{((epoch // VALIDATE_EVERY) + 1) * VALIDATE_EVERY}."
-            )
 
         # ====================================================
         # SCHEDULER
@@ -1199,28 +1441,15 @@ def main():
         )
 
         # ====================================================
-        # LOG RESULTS
+        # PRINT
         # ====================================================
 
-        logger.info(
-            f"Epoch [{epoch:03d}/"
-            f"{cfg.train.epochs:03d}] "
-            f"({elapsed:.1f}s) | "
-
-            f"Train Loss: "
-            f"{train_metrics['loss']:.4f} | "
-
-            f"Train Dice: "
-            f"{train_metrics['dice']:.4f} | "
-
-            f"Val Dice: "
-            f"{val_metrics['val_dice']:.4f}"
-        )
-
         print()
+        print("-" * 70)
 
         print(
-            f"Epoch {epoch}"
+            f"Epoch {epoch:03d}/"
+            f"{cfg.train.epochs:03d}"
         )
 
         print(
@@ -1233,32 +1462,35 @@ def main():
             f"{train_metrics['dice']:.4f}"
         )
 
-        if should_validate:
+        print(
+            f"Val Loss   : "
+            f"{val_metrics['val_loss']:.4f}"
+        )
 
-            print(
-                f"Val Dice   : "
-                f"{val_metrics['val_dice']:.4f}"
-            )
+        print(
+            f"Val Dice   : "
+            f"{val_metrics['val_dice']:.4f}"
+        )
 
-            print(
-                f"Val IoU    : "
-                f"{val_metrics['val_iou']:.4f}"
-            )
+        print(
+            f"Val IoU    : "
+            f"{val_metrics['val_iou']:.4f}"
+        )
 
-            print(
-                f"WT Dice    : "
-                f"{val_metrics['val_dice_wt']:.4f}"
-            )
+        print(
+            f"WT Dice    : "
+            f"{val_metrics['val_dice_wt']:.4f}"
+        )
 
-            print(
-                f"TC Dice    : "
-                f"{val_metrics['val_dice_tc']:.4f}"
-            )
+        print(
+            f"TC Dice    : "
+            f"{val_metrics['val_dice_tc']:.4f}"
+        )
 
-            print(
-                f"ET Dice    : "
-                f"{val_metrics['val_dice_et']:.4f}"
-            )
+        print(
+            f"ET Dice    : "
+            f"{val_metrics['val_dice_et']:.4f}"
+        )
 
         print(
             f"Learning rate: "
@@ -1268,6 +1500,32 @@ def main():
         print(
             f"Epoch time: "
             f"{elapsed / 60:.2f} minutes"
+        )
+
+        print("-" * 70)
+
+        # ====================================================
+        # LOGGER
+        # ====================================================
+
+        logger.info(
+            f"Epoch [{epoch:03d}/"
+            f"{cfg.train.epochs:03d}] | "
+
+            f"Train Loss: "
+            f"{train_metrics['loss']:.4f} | "
+
+            f"Train Dice: "
+            f"{train_metrics['dice']:.4f} | "
+
+            f"Val Loss: "
+            f"{val_metrics['val_loss']:.4f} | "
+
+            f"Val Dice: "
+            f"{val_metrics['val_dice']:.4f} | "
+
+            f"Val IoU: "
+            f"{val_metrics['val_iou']:.4f}"
         )
 
         # ====================================================
@@ -1286,37 +1544,41 @@ def main():
             epoch,
         )
 
-        if should_validate:
+        tb_logger.log_scalar(
+            "Loss/Val",
+            val_metrics["val_loss"],
+            epoch,
+        )
 
-            tb_logger.log_scalar(
-                "Dice/Val",
-                val_metrics["val_dice"],
-                epoch,
-            )
+        tb_logger.log_scalar(
+            "Dice/Val",
+            val_metrics["val_dice"],
+            epoch,
+        )
 
-            tb_logger.log_scalar(
-                "IoU/Val",
-                val_metrics["val_iou"],
-                epoch,
-            )
+        tb_logger.log_scalar(
+            "IoU/Val",
+            val_metrics["val_iou"],
+            epoch,
+        )
 
-            tb_logger.log_scalar(
-                "Dice/Val_WT",
-                val_metrics["val_dice_wt"],
-                epoch,
-            )
+        tb_logger.log_scalar(
+            "Dice/Val_WT",
+            val_metrics["val_dice_wt"],
+            epoch,
+        )
 
-            tb_logger.log_scalar(
-                "Dice/Val_TC",
-                val_metrics["val_dice_tc"],
-                epoch,
-            )
+        tb_logger.log_scalar(
+            "Dice/Val_TC",
+            val_metrics["val_dice_tc"],
+            epoch,
+        )
 
-            tb_logger.log_scalar(
-                "Dice/Val_ET",
-                val_metrics["val_dice_et"],
-                epoch,
-            )
+        tb_logger.log_scalar(
+            "Dice/Val_ET",
+            val_metrics["val_dice_et"],
+            epoch,
+        )
 
         tb_logger.log_scalar(
             "LearningRate",
@@ -1326,134 +1588,121 @@ def main():
 
         # ====================================================
         # CHECKPOINT
-        #
-        # Only update validation checkpoint when validation
-        # actually happened.
         # ====================================================
 
-        if should_validate:
+        is_best = ckpt_manager.step(
+            current_metric=val_metrics["val_dice"],
 
-            is_best = ckpt_manager.step(
-                current_metric=val_metrics["val_dice"],
+            epoch=epoch,
 
-                epoch=epoch,
+            model=model,
 
-                model=model,
+            optimizer=optimizer,
 
-                optimizer=optimizer,
+            scheduler=scheduler,
+        )
 
-                scheduler=scheduler,
+        # ====================================================
+        # BEST MODEL
+        # ====================================================
+
+        if is_best:
+
+            best_val_dice = (
+                val_metrics["val_dice"]
             )
 
-            # =================================================
-            # BEST MODEL
-            # =================================================
+            patience_counter = 0
 
-            if is_best:
+            logger.info(
+                f"[BEST MODEL] "
+                f"Validation Dice = "
+                f"{best_val_dice:.4f}"
+            )
 
-                best_val_dice = (
-                    val_metrics["val_dice"]
+            print()
+            print(
+                "BEST MODEL SAVED"
+            )
+
+            print(
+                f"Best Validation Dice: "
+                f"{best_val_dice:.4f}"
+            )
+
+            # ------------------------------------------------
+            # Visualization
+            # ------------------------------------------------
+
+            if (
+                val_metrics["sample_viz"]
+                is not None
+            ):
+
+                img, tgt, prd = (
+                    val_metrics[
+                        "sample_viz"
+                    ]
                 )
 
-                patience_counter = 0
+                viz_path = os.path.join(
+                    cfg.train.results_dir,
 
-                logger.info(
-                    f"[BEST MODEL] "
-                    f"Validation Dice = "
-                    f"{best_val_dice:.4f}"
+                    f"best_val_epoch_{epoch}.png",
                 )
 
-                print()
+                try:
 
-                print(
-                    "⭐ BEST MODEL SAVED"
-                )
-
-                print(
-                    f"Best Validation Dice: "
-                    f"{best_val_dice:.4f}"
-                )
-
-                # --------------------------------------------
-                # Visualization
-                # --------------------------------------------
-
-                if (
-                    val_metrics["sample_viz"]
-                    is not None
-                ):
-
-                    img, tgt, prd = (
-                        val_metrics[
-                            "sample_viz"
-                        ]
+                    save_prediction_comparison(
+                        img,
+                        tgt,
+                        prd,
+                        save_path=viz_path,
+                        title=(
+                            f"Epoch {epoch} "
+                            f"Best Validation"
+                        ),
                     )
-
-                    viz_path = os.path.join(
-                        cfg.train.results_dir,
-
-                        f"best_val_epoch_{epoch}.png",
-                    )
-
-                    try:
-
-                        save_prediction_comparison(
-                            img,
-                            tgt,
-                            prd,
-                            save_path=viz_path,
-                            title=(
-                                f"Epoch {epoch} "
-                                f"Best Validation"
-                            ),
-                        )
-
-                        print(
-                            "Saved visualization:",
-                            viz_path,
-                        )
-
-                    except Exception as e:
-
-                        logger.warning(
-                            f"Could not save "
-                            f"visualization: {e}"
-                        )
-
-            # -----------------------------------------------
-            # NO IMPROVEMENT
-            # -----------------------------------------------
-
-            else:
-
-                patience_counter += 1
-
-                print()
-
-                print(
-                    f"No improvement. "
-                    f"Patience: "
-                    f"{patience_counter}/"
-                    f"{cfg.train.early_stopping_patience}"
-                )
-
-                if (
-                    patience_counter
-                    >=
-                    cfg.train.early_stopping_patience
-                ):
-
-                    logger.info(
-                        "Early stopping triggered."
-                    )
-
-                    print()
 
                     print(
-                        "Early stopping triggered."
+                        "Saved visualization:",
+                        viz_path,
                     )
 
-                    break
+                except Exception as e:
+
+                    logger.warning(
+                        f"Could not save "
+                        f"visualization: {e}"
+                    )
+
+        else:
+
+            patience_counter += 1
+
+            print(
+                f"No improvement. "
+                f"Patience: "
+                f"{patience_counter}/"
+                f"{cfg.train.early_stopping_patience}"
+            )
+
+            if (
+                patience_counter
+                >=
+                cfg.train.early_stopping_patience
+            ):
+
+                logger.info(
+                    "Early stopping triggered."
+                )
+
+                print()
+                print(
+                    "Early stopping triggered."
+                )
+
+                break
 
     # ========================================================
     # FINISH
@@ -1462,13 +1711,8 @@ def main():
     tb_logger.close()
 
     print()
-
     print("=" * 70)
-
-    print(
-        "TRAINING COMPLETE"
-    )
-
+    print("TRAINING COMPLETE")
     print("=" * 70)
 
     print(
@@ -1477,13 +1721,18 @@ def main():
     )
 
     print(
-        "Training patients:",
-        len(train_dirs),
+        "Train patients:",
+        len(train_ids),
     )
 
     print(
         "Validation patients:",
-        len(val_dirs),
+        len(val_ids),
+    )
+
+    print(
+        "Test patients:",
+        len(test_ids),
     )
 
     print(

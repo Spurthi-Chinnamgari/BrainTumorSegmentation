@@ -1,15 +1,39 @@
-# Python virtual environment
+# Virtual environment
 .venv/
-
-# Input medical imaging data
-input/
-
-# Generated post-processing outputs
-postprocessed/
 
 # Python cache
 __pycache__/
 *.pyc
 
-# Generated feature extraction output
-feature_extraction_results.csv
+# Dataset
+data/brats2023/
+
+# Processed data
+data/processed/
+
+# Dataset split files
+data/splits/
+
+# Model weights / checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Temporary test files
+tests/
+
+# Temporary test
+preprocessing/encoder_input_test.py
+
+# IDE
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+# Local project files
+.venv/
+input/
+postprocessed/
+__pycache__/
+*.pyc

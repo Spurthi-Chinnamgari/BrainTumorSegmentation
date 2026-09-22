@@ -1,6 +1,13 @@
 """
 Configuration module for 3D Attention U-Net
 Multimodal Brain Tumor Segmentation (BraTS 2023).
+
+Current baseline:
+    - 3D Attention U-Net
+    - 4 MRI modalities
+    - Processed 64x64x64 patches
+    - Exact train/validation/test split files
+    - 4 segmentation classes
 """
 
 from dataclasses import dataclass, field
@@ -15,39 +22,78 @@ import torch
 
 @dataclass
 class DatasetConfig:
-    """Dataset and preprocessing configuration."""
+    """Dataset and processed-data configuration."""
 
     # --------------------------------------------------------
-    # BraTS 2023 dataset path
+    # Raw BraTS 2023 dataset
+    #
+    # Used by preprocessing only.
     # --------------------------------------------------------
 
-    data_dir: str = (
+    raw_data_dir: str = (
         r"C:\Datasets\BraTS2023"
         r"\ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
     )
 
-    train_dir: str = (
-        r"C:\Datasets\BraTS2023"
-        r"\ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+    # --------------------------------------------------------
+    # Processed dataset
+    #
+    # Expected structure:
+    #
+    # data/processed/
+    #     train/
+    #         patient_id/
+    #             images.npy
+    #             masks.npy
+    #     val/
+    #         patient_id/
+    #             images.npy
+    #             masks.npy
+    #     test/
+    #         patient_id/
+    #             images.npy
+    #             masks.npy
+    # --------------------------------------------------------
+
+    processed_data_dir: str = (
+        "./data/processed"
     )
 
-    val_dir: str = (
-        r"C:\Datasets\BraTS2023"
-        r"\ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+    # --------------------------------------------------------
+    # Exact split files
+    #
+    # Expected:
+    #
+    # data/splits/train.txt
+    # data/splits/val.txt
+    # data/splits/test.txt
+    # --------------------------------------------------------
+
+    split_dir: str = (
+        "./data/splits"
     )
 
-    test_dir: str = (
-        r"C:\Datasets\BraTS2023"
-        r"\ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+    train_split_file: str = (
+        "./data/splits/train.txt"
+    )
+
+    val_split_file: str = (
+        "./data/splits/val.txt"
+    )
+
+    test_split_file: str = (
+        "./data/splits/test.txt"
     )
 
     # --------------------------------------------------------
     # MRI modalities
     #
-    # t1n = T1 native
-    # t1c = T1 contrast enhanced
-    # t2w = T2 weighted
-    # t2f = T2 FLAIR
+    # Channel order MUST remain:
+    #
+    # 0 = T1n
+    # 1 = T1c
+    # 2 = T2w
+    # 3 = T2f
     # --------------------------------------------------------
 
     modalities: List[str] = field(
@@ -67,7 +113,7 @@ class DatasetConfig:
     # Segmentation classes
     #
     # 0 = Background
-    # 1 = NCR
+    # 1 = NCR/NET
     # 2 = Edema
     # 3 = Enhancing Tumor
     # --------------------------------------------------------
@@ -75,50 +121,33 @@ class DatasetConfig:
     num_classes: int = 4
 
     # --------------------------------------------------------
-    # IMPORTANT:
+    # Processed 3D patch size
     #
-    # This MUST match the patch used by train.py.
-    #
-    # Current training patch:
-    #       (16, 32, 32)
-    #
-    # Do NOT put (128,128,128) here.
+    # MUST match preprocessing and train.py.
     # --------------------------------------------------------
 
     patch_size_3d: Tuple[int, int, int] = (
-        16,
-        32,
-        32,
+        64,
+        64,
+        64,
     )
 
     # --------------------------------------------------------
-    # 2D configuration
+    # Dataset split information
+    #
+    # The actual split is controlled by train.txt,
+    # val.txt and test.txt.
+    #
+    # These values are retained only as documentation.
     # --------------------------------------------------------
 
-    image_size_2d: Tuple[int, int] = (
-        32,
-        32,
-    )
+    expected_train_patients: int = 26
 
-    slice_dim: int = 2
+    expected_val_patients: int = 6
 
-    # --------------------------------------------------------
-    # Dataset splitting
-    # --------------------------------------------------------
-
-    val_split: float = 0.15
-
-    test_split: float = 0.15
+    expected_test_patients: int = 5
 
     seed: int = 42
-
-    # --------------------------------------------------------
-    # Intensity normalization
-    # --------------------------------------------------------
-
-    normalize_intensity: bool = True
-
-    z_score: bool = True
 
 
 # ============================================================
@@ -127,10 +156,10 @@ class DatasetConfig:
 
 @dataclass
 class ModelConfig:
-    """Attention U-Net model configuration."""
+    """3D Attention U-Net model configuration."""
 
     # --------------------------------------------------------
-    # We are using 3D
+    # Model dimension
     # --------------------------------------------------------
 
     dimension: str = "3d"
@@ -144,13 +173,9 @@ class ModelConfig:
     out_channels: int = 4
 
     # --------------------------------------------------------
-    # IMPORTANT:
+    # Encoder feature sizes
     #
-    # These MUST match the model used during training.
-    #
-    # Your train.py currently uses:
-    #
-    # [16, 32, 64, 128, 256]
+    # MUST match AttentionUNet3D used for training.
     # --------------------------------------------------------
 
     features: List[int] = field(
@@ -258,8 +283,6 @@ class TrainConfig:
 
     # --------------------------------------------------------
     # DataLoader workers
-    #
-    # Keeping this 0 avoids Windows multiprocessing problems.
     # --------------------------------------------------------
 
     num_workers: int = 0
@@ -283,7 +306,7 @@ class TrainConfig:
     # --------------------------------------------------------
     # Loss weights
     #
-    # Dice + BCE
+    # Dice + multiclass Cross Entropy
     # --------------------------------------------------------
 
     dice_weight: float = 0.5
@@ -312,10 +335,6 @@ class Config:
     )
 
     def __post_init__(self):
-
-        # ----------------------------------------------------
-        # Create required directories
-        # ----------------------------------------------------
 
         os.makedirs(
             self.train.checkpoint_dir,

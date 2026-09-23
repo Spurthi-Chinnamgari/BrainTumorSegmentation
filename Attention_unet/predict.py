@@ -2,20 +2,36 @@
 3D Attention U-Net Inference
 ============================
 
-Uses the trained Attention U-Net model to generate a
-3D segmentation mask for a REAL BraTS patient.
+Inference using the processed BraTS 2023 dataset.
 
-Training patch size:
-    (16, 32, 32)
+Processed input:
+    images.npy -> (N, 4, 64, 64, 64)
 
-Input modalities:
-    t1n, t1c, t2w, t2f
+Modalities:
+    0 = T1n
+    1 = T1c
+    2 = T2w
+    3 = T2f
 
 Output classes:
     0 = Background
     1 = NCR/NET
     2 = Edema
     3 = Enhancing Tumor
+
+IMPORTANT:
+    This baseline inference operates on the already extracted
+    64x64x64 processed patches.
+
+    It does NOT:
+        - load raw NIfTI for model input
+        - perform Z-score normalization again
+        - perform random cropping
+        - use the old 16x32x32 patches
+        - use the old 50% sliding-window inference
+
+True full-volume reconstruction requires patch-coordinate /
+cropped-volume metadata from preprocessing.
 """
 
 import os
@@ -23,19 +39,9 @@ import argparse
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-import nibabel as nib
 
 from dataset import BraTSDataset3D
-
-from dataset.transforms import (
-    ZScoreNormalize,
-    ToTensor,
-    ComposeTransforms,
-)
-
 from models import AttentionUNet3D
-
 from utils import load_checkpoint
 
 
@@ -43,324 +49,304 @@ from utils import load_checkpoint
 # SETTINGS
 # ============================================================
 
-PATCH_SIZE = (16, 32, 32)
+PATCH_SIZE = (64, 64, 64)
 
-# 50% overlap
-STRIDE = (8, 16, 16)
-
+NUM_MODALITIES = 4
 NUM_CLASSES = 4
 
+FEATURES = [
+    16,
+    32,
+    64,
+    128,
+    256,
+]
+
+DROPOUT = 0.1
+
 
 # ============================================================
-# LOAD PATIENT
+# PATH DISCOVERY
 # ============================================================
 
-def load_patient(patient_dir):
+def find_processed_root():
 
-    print()
-    print("=" * 60)
-    print("LOADING PATIENT")
-    print("=" * 60)
+    candidates = [
+        os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "preprocessing",
+                "data",
+                "processed",
+            )
+        ),
+        os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "data",
+                "processed",
+            )
+        ),
+        os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "data",
+                "processed",
+            )
+        ),
+    ]
 
-    print()
-    print("Patient directory:")
-    print(patient_dir)
+    for path in candidates:
 
-    transform = ComposeTransforms([
-        ZScoreNormalize(),
-        ToTensor(),
-    ])
+        if os.path.isdir(path):
+            return path
 
-    dataset = BraTSDataset3D(
-        [patient_dir],
-        transform=transform,
-        is_train=False,
+    raise FileNotFoundError(
+        "Could not find processed dataset.\n"
+        "Expected one of:\n"
+        + "\n".join(candidates)
     )
 
-    sample = dataset[0]
 
-    image = sample["image"]
+def find_split_root():
 
-    mask = sample.get("mask", None)
+    candidates = [
+        os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "preprocessing",
+                "data",
+                "splits",
+            )
+        ),
+        os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "data",
+                "splits",
+            )
+        ),
+        os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "data",
+                "splits",
+            )
+        ),
+    ]
 
-    return image, mask
+    for path in candidates:
+
+        if os.path.isdir(path):
+            return path
+
+    raise FileNotFoundError(
+        "Could not find split directory.\n"
+        "Expected one of:\n"
+        + "\n".join(candidates)
+    )
 
 
 # ============================================================
-# PAD VOLUME
+# SPLIT FILE
 # ============================================================
 
-def pad_volume(image, patch_size):
+def read_patient_ids(split_file):
 
-    """
-    Input:
-        (C, D, H, W)
+    if not os.path.isfile(split_file):
 
-    Output:
-        padded image
-    """
-
-    if image.ndim != 4:
-        raise RuntimeError(
-            "pad_volume expected (C,D,H,W), "
-            f"but got {tuple(image.shape)}"
+        raise FileNotFoundError(
+            f"Split file does not exist:\n{split_file}"
         )
 
-    _, D, H, W = image.shape
+    patient_ids = []
 
-    pd = max(0, patch_size[0] - D)
-    ph = max(0, patch_size[1] - H)
-    pw = max(0, patch_size[2] - W)
+    with open(
+        split_file,
+        "r",
+        encoding="utf-8",
+    ) as f:
 
-    if pd == 0 and ph == 0 and pw == 0:
-        return image, (0, 0, 0)
+        for line in f:
 
-    image = F.pad(
-        image,
-        (
-            0, pw,
-            0, ph,
-            0, pd,
-        ),
-        mode="constant",
-        value=0,
-    )
+            patient_id = line.strip()
 
-    return image, (pd, ph, pw)
+            if patient_id:
+                patient_ids.append(patient_id)
+
+    if not patient_ids:
+
+        raise RuntimeError(
+            f"Split file is empty:\n{split_file}"
+        )
+
+    return patient_ids
 
 
 # ============================================================
-# PATCH POSITIONS
+# VERIFY PROCESSED PATIENT
 # ============================================================
 
-def get_positions(
-    volume_size,
-    patch_size,
-    stride,
+def verify_patient(
+    processed_root,
+    split,
+    patient_id,
 ):
 
-    if volume_size <= patch_size:
-        return [0]
+    patient_dir = os.path.join(
+        processed_root,
+        split,
+        patient_id,
+    )
 
-    positions = []
+    images_path = os.path.join(
+        patient_dir,
+        "images.npy",
+    )
 
-    position = 0
+    masks_path = os.path.join(
+        patient_dir,
+        "masks.npy",
+    )
 
-    while position + patch_size < volume_size:
+    if not os.path.isfile(images_path):
 
-        positions.append(position)
+        raise FileNotFoundError(
+            f"Missing images.npy:\n{images_path}"
+        )
 
-        position += stride
+    if not os.path.isfile(masks_path):
 
-    last_position = volume_size - patch_size
+        raise FileNotFoundError(
+            f"Missing masks.npy:\n{masks_path}"
+        )
 
-    if len(positions) == 0 or positions[-1] != last_position:
-        positions.append(last_position)
+    images = np.load(
+        images_path,
+        mmap_mode="r",
+    )
 
-    return positions
+    masks = np.load(
+        masks_path,
+        mmap_mode="r",
+    )
+
+    if images.ndim != 5:
+
+        raise RuntimeError(
+            f"{patient_id}: expected images "
+            f"(N,4,64,64,64), got {images.shape}"
+        )
+
+    if images.shape[1:] != (
+        NUM_MODALITIES,
+        *PATCH_SIZE,
+    ):
+
+        raise RuntimeError(
+            f"{patient_id}: invalid image shape "
+            f"{images.shape}. "
+            f"Expected (N,4,64,64,64)."
+        )
+
+    if masks.ndim != 4:
+
+        raise RuntimeError(
+            f"{patient_id}: expected masks "
+            f"(N,64,64,64), got {masks.shape}"
+        )
+
+    if masks.shape[1:] != PATCH_SIZE:
+
+        raise RuntimeError(
+            f"{patient_id}: invalid mask shape "
+            f"{masks.shape}. "
+            f"Expected (N,64,64,64)."
+        )
+
+    if images.shape[0] != masks.shape[0]:
+
+        raise RuntimeError(
+            f"{patient_id}: image/mask patch count mismatch.\n"
+            f"Images: {images.shape[0]}\n"
+            f"Masks : {masks.shape[0]}"
+        )
+
+    labels = np.unique(masks)
+
+    invalid_labels = [
+        int(x)
+        for x in labels
+        if int(x) not in range(NUM_CLASSES)
+    ]
+
+    if invalid_labels:
+
+        raise RuntimeError(
+            f"{patient_id}: invalid mask labels "
+            f"{invalid_labels}. "
+            f"Expected labels 0,1,2,3."
+        )
+
+    return images.shape[0]
 
 
 # ============================================================
-# SLIDING WINDOW PREDICTION
+# PREDICT ONE PATCH
 # ============================================================
 
-def sliding_window_prediction(
+def predict_patch(
     model,
     image,
     device,
-    patch_size=PATCH_SIZE,
-    stride=STRIDE,
 ):
 
-    if image.ndim != 5:
+    if image.ndim != 4:
 
         raise RuntimeError(
-            "Expected image shape "
-            "(B,C,D,H,W), but got "
+            "Expected image "
+            "(C,D,H,W), got "
             f"{tuple(image.shape)}"
         )
 
-    B, C, D, H, W = image.shape
+    if tuple(image.shape) != (
+        NUM_MODALITIES,
+        *PATCH_SIZE,
+    ):
 
-    if B != 1:
         raise RuntimeError(
-            f"Expected batch size 1, got {B}"
+            "Invalid model input shape.\n"
+            f"Got: {tuple(image.shape)}\n"
+            f"Expected: "
+            f"({NUM_MODALITIES},64,64,64)"
         )
 
-    if C != 4:
-        raise RuntimeError(
-            f"Expected 4 MRI modalities, got {C}"
-        )
-
-    pd, ph, pw = patch_size
-
-    # --------------------------------------------------------
-    # PATCH POSITIONS
-    # --------------------------------------------------------
-
-    d_positions = get_positions(
-        D,
-        pd,
-        stride[0],
-    )
-
-    h_positions = get_positions(
-        H,
-        ph,
-        stride[1],
-    )
-
-    w_positions = get_positions(
-        W,
-        pw,
-        stride[2],
-    )
-
-    total_patches = (
-        len(d_positions)
-        * len(h_positions)
-        * len(w_positions)
-    )
-
-    print()
-    print("=" * 60)
-    print("SLIDING-WINDOW INFERENCE")
-    print("=" * 60)
-
-    print()
-    print("Volume :", (D, H, W))
-    print("Patch  :", patch_size)
-    print("Stride :", stride)
-
-    print()
-    print("D positions:", d_positions)
-    print("H positions:", h_positions)
-    print("W positions:", w_positions)
-
-    print()
-    print("Total patches:", total_patches)
-
-    # --------------------------------------------------------
-    # ACCUMULATORS
-    # --------------------------------------------------------
-
-    logits_sum = torch.zeros(
-        (
-            1,
-            NUM_CLASSES,
-            D,
-            H,
-            W,
-        ),
-        dtype=torch.float32,
-        device=device,
-    )
-
-    count_map = torch.zeros(
-        (
-            1,
-            1,
-            D,
-            H,
-            W,
-        ),
-        dtype=torch.float32,
-        device=device,
-    )
-
-    # --------------------------------------------------------
-    # INFERENCE
-    # --------------------------------------------------------
-
-    model.eval()
-
-    patch_number = 0
+    image = image.unsqueeze(0).to(device)
 
     with torch.no_grad():
 
-        for d in d_positions:
+        logits = model(image)
 
-            for h in h_positions:
-
-                for w in w_positions:
-
-                    patch_number += 1
-
-                    patch = image[
-                        :,
-                        :,
-                        d:d + pd,
-                        h:h + ph,
-                        w:w + pw,
-                    ]
-
-                    patch = patch.to(device)
-
-                    logits = model(patch)
-
-                    if logits.ndim != 5:
-
-                        raise RuntimeError(
-                            "Model output should be "
-                            "(B,C,D,H,W), but got "
-                            f"{tuple(logits.shape)}"
-                        )
-
-                    if logits.shape[1] != NUM_CLASSES:
-
-                        raise RuntimeError(
-                            f"Expected {NUM_CLASSES} classes, "
-                            f"but model returned "
-                            f"{logits.shape[1]}"
-                        )
-
-                    # ------------------------------------------------
-                    # ADD LOGITS
-                    # ------------------------------------------------
-
-                    logits_sum[
-                        :,
-                        :,
-                        d:d + pd,
-                        h:h + ph,
-                        w:w + pw,
-                    ] += logits.float()
-
-                    # ------------------------------------------------
-                    # COUNT OVERLAPPING PATCHES
-                    # ------------------------------------------------
-
-                    count_map[
-                        :,
-                        :,
-                        d:d + pd,
-                        h:h + ph,
-                        w:w + pw,
-                    ] += 1.0
-
-                    print(
-                        f"\rProcessing patch "
-                        f"{patch_number}/{total_patches}",
-                        end="",
-                    )
-
-    print()
-
-    # --------------------------------------------------------
-    # AVERAGE LOGITS
-    # --------------------------------------------------------
-
-    logits_average = (
-        logits_sum /
-        count_map.clamp_min(1.0)
+    expected_shape = (
+        1,
+        NUM_CLASSES,
+        *PATCH_SIZE,
     )
 
-    # --------------------------------------------------------
-    # ARGMAX
-    # --------------------------------------------------------
+    if tuple(logits.shape) != expected_shape:
+
+        raise RuntimeError(
+            "Invalid model output shape.\n"
+            f"Got: {tuple(logits.shape)}\n"
+            f"Expected: {expected_shape}"
+        )
 
     prediction = torch.argmax(
-        logits_average,
+        logits,
         dim=1,
     )
 
@@ -373,96 +359,6 @@ def sliding_window_prediction(
     )
 
     return prediction
-
-
-# ============================================================
-# SAVE NIFTI
-# ============================================================
-
-def save_prediction_nifti(
-    prediction,
-    patient_dir,
-    patient_id,
-    output_dir,
-):
-
-    os.makedirs(
-        output_dir,
-        exist_ok=True,
-    )
-
-    # --------------------------------------------------------
-    # FIND T1N
-    # --------------------------------------------------------
-
-    t1_path = os.path.join(
-        patient_dir,
-        f"{patient_id}-t1n.nii.gz",
-    )
-
-    if not os.path.isfile(t1_path):
-
-        t1_path = None
-
-        for name in os.listdir(patient_dir):
-
-            if (
-                "t1n" in name.lower()
-                and name.endswith(".nii.gz")
-                and os.path.isfile(
-                    os.path.join(patient_dir, name)
-                )
-            ):
-
-                t1_path = os.path.join(
-                    patient_dir,
-                    name,
-                )
-
-                break
-
-    if t1_path is None:
-
-        raise FileNotFoundError(
-            "Could not find T1 native MRI."
-        )
-
-    print()
-    print("=" * 60)
-    print("SAVING 3D SEGMENTATION")
-    print("=" * 60)
-
-    print()
-    print("Reference MRI:")
-    print(t1_path)
-
-    reference_nii = nib.load(t1_path)
-
-    if reference_nii.shape != prediction.shape:
-
-        raise RuntimeError(
-            "Prediction shape does not match MRI shape.\n"
-            f"MRI: {reference_nii.shape}\n"
-            f"Prediction: {prediction.shape}"
-        )
-
-    output_path = os.path.join(
-        output_dir,
-        f"{patient_id}_pred_seg.nii.gz",
-    )
-
-    prediction_nii = nib.Nifti1Image(
-        prediction.astype(np.uint8),
-        reference_nii.affine,
-        reference_nii.header.copy(),
-    )
-
-    nib.save(
-        prediction_nii,
-        output_path,
-    )
-
-    return output_path
 
 
 # ============================================================
@@ -483,10 +379,6 @@ def print_statistics(
     print("Prediction shape:")
     print(prediction.shape)
 
-    # --------------------------------------------------------
-    # PREDICTION CLASSES
-    # --------------------------------------------------------
-
     unique, counts = np.unique(
         prediction,
         return_counts=True,
@@ -505,10 +397,6 @@ def print_statistics(
             f"{int(count)} voxels"
         )
 
-    # --------------------------------------------------------
-    # TUMOR VOXELS
-    # --------------------------------------------------------
-
     tumor_voxels = int(
         np.sum(prediction > 0)
     )
@@ -519,23 +407,11 @@ def print_statistics(
         tumor_voxels,
     )
 
-    # --------------------------------------------------------
-    # GROUND TRUTH
-    # --------------------------------------------------------
-
     if ground_truth is not None:
 
-        if torch.is_tensor(ground_truth):
-
-            gt = ground_truth.cpu().numpy()
-
-        else:
-
-            gt = np.asarray(
-                ground_truth
-            )
-
-        gt = np.squeeze(gt)
+        gt = np.asarray(
+            ground_truth
+        ).squeeze()
 
         print()
         print("Ground Truth shape:")
@@ -586,17 +462,158 @@ def print_statistics(
 
 
 # ============================================================
+# PREDICT PROCESSED PATIENT
+# ============================================================
+
+def predict_patient(
+    model,
+    dataset,
+    patient_id,
+    device,
+):
+
+    print()
+    print("=" * 60)
+    print("PATIENT INFERENCE")
+    print("=" * 60)
+
+    print()
+    print("Patient:")
+    print(patient_id)
+
+    print()
+    print("Number of processed patches:")
+    print(len(dataset))
+
+    predictions = []
+
+    ground_truths = []
+
+    model.eval()
+
+    for index in range(len(dataset)):
+
+        sample = dataset[index]
+
+        image = sample["image"]
+        mask = sample.get("mask")
+
+        prediction = predict_patch(
+            model=model,
+            image=image,
+            device=device,
+        )
+
+        predictions.append(
+            prediction
+        )
+
+        if mask is not None:
+
+            if torch.is_tensor(mask):
+
+                mask_np = (
+                    mask.cpu()
+                    .numpy()
+                    .astype(np.uint8)
+                )
+
+            else:
+
+                mask_np = np.asarray(
+                    mask,
+                    dtype=np.uint8,
+                )
+
+            ground_truths.append(
+                mask_np
+            )
+
+        print(
+            f"\rProcessing patch "
+            f"{index + 1}/{len(dataset)}",
+            end="",
+        )
+
+    print()
+
+    predictions = np.stack(
+        predictions,
+        axis=0,
+    )
+
+    print()
+    print("Prediction array shape:")
+    print(predictions.shape)
+
+    return predictions, ground_truths
+
+
+# ============================================================
+# SAVE PROCESSED PREDICTION
+# ============================================================
+
+def save_prediction(
+    predictions,
+    ground_truths,
+    output_dir,
+    patient_id,
+):
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
+
+    prediction_path = os.path.join(
+        output_dir,
+        f"{patient_id}_predictions.npy",
+    )
+
+    np.save(
+        prediction_path,
+        predictions,
+    )
+
+    print()
+    print("Prediction saved:")
+    print(prediction_path)
+
+    if ground_truths:
+
+        ground_truth = np.stack(
+            ground_truths,
+            axis=0,
+        )
+
+        ground_truth_path = os.path.join(
+            output_dir,
+            f"{patient_id}_ground_truth.npy",
+        )
+
+        np.save(
+            ground_truth_path,
+            ground_truth,
+        )
+
+        print()
+        print("Ground truth saved:")
+        print(ground_truth_path)
+
+    return prediction_path
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
 
-    # ========================================================
-    # ARGUMENTS
-    # ========================================================
-
     parser = argparse.ArgumentParser(
-        description="3D Attention U-Net inference"
+        description=(
+            "3D Attention U-Net inference "
+            "on processed BraTS patches"
+        )
     )
 
     parser.add_argument(
@@ -607,14 +624,27 @@ def main():
     )
 
     parser.add_argument(
-        "--patient-dir",
+        "--patient-id",
         type=str,
-        default=(
-            "C:/Datasets/BraTS2023/"
-            "ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData/"
-            "BraTS-GLI-00008-001"
+        default=None,
+        help=(
+            "Patient ID from the test split. "
+            "If omitted, the first test patient is used."
         ),
-        help="REAL BraTS patient directory",
+    )
+
+    parser.add_argument(
+        "--processed-root",
+        type=str,
+        default=None,
+        help="Processed dataset root",
+    )
+
+    parser.add_argument(
+        "--split-root",
+        type=str,
+        default=None,
+        help="Split directory",
     )
 
     parser.add_argument(
@@ -645,39 +675,110 @@ def main():
     print("Device:")
     print(device)
 
-    print()
-    print("Patient:")
-    print(args.patient_dir)
-
-    print()
-    print("Checkpoint:")
-    print(args.checkpoint)
-
     # ========================================================
-    # CHECK PATIENT
+    # PATHS
     # ========================================================
 
-    if not os.path.isdir(
-        args.patient_dir
-    ):
+    processed_root = (
+        os.path.abspath(args.processed_root)
+        if args.processed_root
+        else find_processed_root()
+    )
 
-        raise FileNotFoundError(
-            "Patient directory does not exist:\n"
-            f"{args.patient_dir}"
-        )
+    split_root = (
+        os.path.abspath(args.split_root)
+        if args.split_root
+        else find_split_root()
+    )
+
+    split_file = os.path.join(
+        split_root,
+        "test.txt",
+    )
+
+    print()
+    print("Processed dataset:")
+    print(processed_root)
+
+    print()
+    print("Test split:")
+    print(split_file)
 
     # ========================================================
     # CHECK CHECKPOINT
     # ========================================================
 
-    if not os.path.isfile(
+    checkpoint = os.path.abspath(
         args.checkpoint
-    ):
+    )
+
+    if not os.path.isfile(checkpoint):
 
         raise FileNotFoundError(
             "Checkpoint does not exist:\n"
-            f"{args.checkpoint}"
+            f"{checkpoint}\n\n"
+            "Train the model first before running inference."
         )
+
+    # ========================================================
+    # READ TEST SPLIT
+    # ========================================================
+
+    patient_ids = read_patient_ids(
+        split_file
+    )
+
+    print()
+    print("Test patients:")
+    print(patient_ids)
+
+    # ========================================================
+    # SELECT PATIENT
+    # ========================================================
+
+    if args.patient_id is None:
+
+        patient_id = patient_ids[0]
+
+    else:
+
+        patient_id = args.patient_id
+
+        if patient_id not in patient_ids:
+
+            raise ValueError(
+                f"Patient '{patient_id}' is not present "
+                "in test.txt."
+            )
+
+    # ========================================================
+    # VERIFY PATIENT
+    # ========================================================
+
+    num_patches = verify_patient(
+        processed_root=processed_root,
+        split="test",
+        patient_id=patient_id,
+    )
+
+    print()
+    print("Patient:")
+    print(patient_id)
+
+    print()
+    print("Processed patches:")
+    print(num_patches)
+
+    # ========================================================
+    # CREATE DATASET
+    # ========================================================
+
+    dataset = BraTSDataset3D(
+        processed_root=processed_root,
+        split="test",
+        split_file=split_file,
+        patch_size=PATCH_SIZE,
+    )
 
     # ========================================================
     # CREATE MODEL
@@ -687,16 +788,10 @@ def main():
     print("Creating Attention U-Net 3D...")
 
     model = AttentionUNet3D(
-        in_channels=4,
-        out_channels=4,
-        features=[
-            16,
-            32,
-            64,
-            128,
-            256,
-        ],
-        dropout=0.1,
+        in_channels=NUM_MODALITIES,
+        out_channels=NUM_CLASSES,
+        features=FEATURES,
+        dropout=DROPOUT,
         use_transpose=True,
     ).to(device)
 
@@ -705,10 +800,10 @@ def main():
     # ========================================================
 
     print()
-    print("Loading trained model...")
+    print("Loading trained checkpoint...")
 
     load_checkpoint(
-        args.checkpoint,
+        checkpoint,
         model=model,
         device=device,
     )
@@ -717,137 +812,131 @@ def main():
     print("Checkpoint loaded successfully.")
 
     # ========================================================
-    # LOAD PATIENT
+    # GET PATIENT PATCH INDICES
     # ========================================================
 
-    image, ground_truth = load_patient(
-        args.patient_dir
-    )
+    patient_indices = [
+        index
+        for index in range(len(dataset))
+        if dataset[index]["patient_id"] == patient_id
+    ]
 
-    print()
-    print("Original image shape:")
-    print(image.shape)
-
-    if image.ndim != 4:
+    if not patient_indices:
 
         raise RuntimeError(
-            "Expected image shape "
-            "(4,D,H,W), but got "
-            f"{tuple(image.shape)}"
+            f"No processed patches found for "
+            f"patient {patient_id}."
         )
-
-    # ========================================================
-    # PAD
-    # ========================================================
-
-    original_shape = image.shape[1:]
-
-    print()
-    print("Padding volume if necessary...")
-
-    image_padded, padding = pad_volume(
-        image,
-        PATCH_SIZE,
-    )
-
-    print()
-    print("Original spatial shape:")
-    print(original_shape)
-
-    print()
-    print("Padded spatial shape:")
-    print(image_padded.shape[1:])
-
-    print()
-    print("Padding:")
-    print(padding)
-
-    # ========================================================
-    # ADD BATCH DIMENSION
-    # ========================================================
-
-    image_padded = image_padded.unsqueeze(0)
-
-    print()
-    print("Model input:")
-    print(tuple(image_padded.shape))
 
     # ========================================================
     # PREDICTION
     # ========================================================
 
-    prediction = sliding_window_prediction(
-        model=model,
-        image=image_padded,
-        device=device,
-        patch_size=PATCH_SIZE,
-        stride=STRIDE,
-    )
+    predictions = []
+    ground_truths = []
 
-    # ========================================================
-    # REMOVE PADDING
-    # ========================================================
+    model.eval()
 
-    D, H, W = original_shape
+    for count, dataset_index in enumerate(
+        patient_indices,
+        start=1,
+    ):
 
-    prediction = prediction[
-        :D,
-        :H,
-        :W,
-    ]
+        sample = dataset[
+            dataset_index
+        ]
 
-    print()
-    print("Prediction shape after removing padding:")
-    print(prediction.shape)
+        image = sample["image"]
+        mask = sample["mask"]
 
-    # ========================================================
-    # GROUND TRUTH
-    # ========================================================
+        prediction = predict_patch(
+            model=model,
+            image=image,
+            device=device,
+        )
 
-    gt_np = None
+        predictions.append(
+            prediction
+        )
 
-    if ground_truth is not None:
+        if torch.is_tensor(mask):
 
-        if torch.is_tensor(ground_truth):
-
-            gt_np = ground_truth.cpu().numpy()
+            mask_np = (
+                mask.cpu()
+                .numpy()
+                .astype(np.uint8)
+            )
 
         else:
 
-            gt_np = np.asarray(
-                ground_truth
+            mask_np = np.asarray(
+                mask,
+                dtype=np.uint8,
             )
 
-        gt_np = np.squeeze(gt_np)
-
-    # ========================================================
-    # STATISTICS
-    # ========================================================
-
-    print_statistics(
-        prediction,
-        gt_np,
-    )
-
-    # ========================================================
-    # PATIENT ID
-    # ========================================================
-
-    patient_id = os.path.basename(
-        os.path.normpath(
-            args.patient_dir
+        ground_truths.append(
+            mask_np
         )
+
+        print(
+            f"\rProcessing patch "
+            f"{count}/{len(patient_indices)}",
+            end="",
+        )
+
+    print()
+
+    predictions = np.stack(
+        predictions,
+        axis=0,
     )
+
+    ground_truths = np.stack(
+        ground_truths,
+        axis=0,
+    )
+
+    # ========================================================
+    # PATCH STATISTICS
+    # ========================================================
+
+    print()
+    print("=" * 60)
+    print("PATIENT PATCH RESULTS")
+    print("=" * 60)
+
+    print()
+    print("Prediction array:")
+    print(predictions.shape)
+
+    print()
+    print("Ground truth array:")
+    print(ground_truths.shape)
+
+    print()
+
+    for index in range(
+        len(predictions)
+    ):
+
+        print(
+            f"Patch {index + 1}:"
+        )
+
+        print_statistics(
+            predictions[index],
+            ground_truths[index],
+        )
 
     # ========================================================
     # SAVE
     # ========================================================
 
-    output_path = save_prediction_nifti(
-        prediction=prediction,
-        patient_dir=args.patient_dir,
-        patient_id=patient_id,
+    output_path = save_prediction(
+        predictions=predictions,
+        ground_truths=ground_truths,
         output_dir=args.output_dir,
+        patient_id=patient_id,
     )
 
     # ========================================================
@@ -864,21 +953,21 @@ def main():
     print(patient_id)
 
     print()
-    print("Prediction saved to:")
+    print("Prediction:")
     print(output_path)
 
     print()
-    print("Final prediction shape:")
-    print(prediction.shape)
+    print("Prediction shape:")
+    print(predictions.shape)
 
     print()
-    print("Prediction classes:")
-    print(np.unique(prediction))
+    print("Classes:")
+    print(np.unique(predictions))
 
     print()
     print(
         "Predicted tumor voxels:",
-        int(np.sum(prediction > 0)),
+        int(np.sum(predictions > 0)),
     )
 
     print()

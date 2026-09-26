@@ -38,4 +38,8 @@ postprocessed/
 __pycache__/
 *.pyc
 
+<<<<<<< HEAD
 checkpoint_extracted/
+=======
+!checkpoints/best_model.pth
+>>>>>>> 606a71cb4537888d4cca02a918f964503d46bc61

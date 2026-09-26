@@ -6,7 +6,7 @@ Ref: Oktay et al., 'Attention U-Net: Learning Where to Look for the Pancreas', M
 from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
-from models.building_blocks import DoubleConv3D, UpBlock3D
+from .building_blocks import DoubleConv3D, UpBlock3D
 
 
 class AttentionUNet3D(nn.Module):
